@@ -297,6 +297,7 @@ fuxi_psci_reset(void)
 static void
 fuxi_dual_boot(void)
 {
+	return;	/* dual boot disabled while bringing up drivers */
 	for (unsigned i = 0; i < 600; i++) {
 		if (fuxi_vol_up()) {
 			return;
