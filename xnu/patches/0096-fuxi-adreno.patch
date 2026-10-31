@@ -900,7 +900,7 @@
 + memcpy((void *)meta_va, fw, p->header);
 + memcpy((void *)(meta_va + p->hash_off), fw + p->hash_off, p->hash_size);
 + flush_dcache((vm_offset_t)meta_va, G5_META_BYTES, 0);
-+ meta_pa = kvtophys(meta_va);
++ meta_pa = (uint64_t)pmap_find_phys(kernel_pmap, (addr64_t)meta_va) << PAGE_SHIFT;
 + if (!meta_pa) {
 +  return 0xf09;
 + }
