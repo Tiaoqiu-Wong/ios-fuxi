@@ -1,33 +1,13 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index ac6a4e7..2b00d54 100755
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7415,12 +7415,23 @@
- 			printf("Allowing spawn of iOS binary %s since it has "
+@@ -7526,7 +7526,7 @@ process_signature(proc_t p, struct image_params *imgp)
  			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
  			    "boot-arg set to true\n", p->p_name);
- 		} else if (psa->psa_platform != PLATFORM_IOS) {
-+#if defined(SWEET) && (DEBUG || DEVELOPMENT)
-+			/*
-+			 * SWEET/FUXI: this kernel is built with the macOS SDK, whose
-+			 * struct _posix_spawnattr does not match the layout that the
-+			 * iOS launchd fills in, so psa_platform reads as a non-iOS
-+			 * value on every spawn. Honour the same bring-up escape as
-+			 * the branch above instead of refusing every daemon.
-+			 */
-+			if (!unentitled_ios_sim_launch) {
-+#endif
+ #endif
+-		} else if (psa->psa_platform != PLATFORM_IOS) {
++		} else if (psa->psa_platform != PLATFORM_IOS && !unentitled_ios_sim_launch) {
  			/* Simulator binary spawned with wrong platform */
  			signature_failure_reason = os_reason_create(OS_REASON_EXEC,
  			    EXEC_EXIT_REASON_WRONG_PLATFORM);
- 			error = EACCES;
- 			goto done;
-+#if defined(SWEET) && (DEBUG || DEVELOPMENT)
-+			}
-+			printf("SWEET: allowing spawn of %s despite platform %d\n",
-+			    p->p_name, psa->psa_platform);
-+#endif
- 		} else {
- 			printf("Allowing spawn of iOS binary %s since correct platform was passed in spawn\n",
- 			    p->p_name);
- 		}
- 	}
- #endif /* XNU_TARGET_OS_OSX */
