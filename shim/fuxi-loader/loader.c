@@ -208,6 +208,105 @@ static const char *loader_boot(void)
 	return "xnu returned";
 }
 
+
+/* ---------------- dual-boot key check (SPMI PMIC arbiter v7, EE 0) ----------------
+ * The kernel's sweet_spmi.c reads PMIC registers through the arbiter's observer
+ * channel; the same sequence works here because the loader runs with the
+ * firmware's identity map still active, so the SPMI windows are directly
+ * accessible.  Volume-up (PM8550 SID 1 GPIO6, RT_STS bit 0, active low) is
+ * sampled for a few seconds: held means "boot iOS", otherwise the loader
+ * resets the SoC so ABL continues into Android.
+ */
+#define FK_CORE_PA  0x0c400000ull
+#define FK_CNFG_PA  0x0c42d000ull
+#define FK_OBS_PA   0x0c440000ull
+#define FK_MAP_OFF  0x2000u
+#define FK_GPIO_PPID 0x18du
+
+static uint32_t
+fk_rd(uintptr_t base, uint32_t off)
+{
+	uint32_t v = *(volatile uint32_t *)(uintptr_t)(base + off);
+	__asm__ volatile("dmb oshld" ::: "memory");
+	return v;
+}
+
+static int
+fk_find_apid(uint16_t ppid)
+{
+	int found = -1;
+	for (uint32_t i = 0; i < 1024; i++) {
+		uint32_t map = fk_rd(FK_CORE_PA, FK_MAP_OFF + 4u * i);
+		if (!map || ((map >> 8) & 0xfffu) != ppid) {
+			continue;
+		}
+		unsigned owner = fk_rd(FK_CNFG_PA, 4u * i) & 7u;
+		if (found < 0 || owner == 0) {
+			found = (int)i;
+		}
+	}
+	return found;
+}
+
+static int
+fk_read8(int apid, uint8_t reg, uint8_t *out)
+{
+	if (apid < 0) {
+		return 0;
+	}
+	uint32_t off = 0x20u * (uint32_t)apid;
+	__asm__ volatile("dmb oshst" ::: "memory");
+	*(volatile uint32_t *)(uintptr_t)(FK_OBS_PA + off) = (1u << 27) | ((uint32_t)reg << 4);
+	__asm__ volatile("dsb osh" ::: "memory");
+	for (unsigned i = 0; i < 1000; i++) {
+		uint32_t st = fk_rd(FK_OBS_PA, off + 8u);
+		if (st & 1u) {
+			if (st & 0x0eu) {
+				return 0;
+			}
+			*out = (uint8_t)fk_rd(FK_OBS_PA, off + 0x18u);
+			return 1;
+		}
+		for (volatile int d = 0; d < 200; d++) {
+		}
+	}
+	return 0;
+}
+
+static int
+fuxi_vol_up(void)
+{
+	uint8_t rt = 0;
+	if (!fk_read8(fk_find_apid(FK_GPIO_PPID), 0x10, &rt)) {
+		return 0;
+	}
+	return (rt & 1u) == 0;      /* GPIO6 is active low */
+}
+
+static void
+fuxi_psci_reset(void)
+{
+	register uint64_t x0 __asm__("x0") = 0x84000009ull;   /* SYSTEM_RESET */
+	__asm__ volatile("smc #0" :: "r"(x0) : "x1", "x2", "x3", "memory");
+	for (;;) {
+		__asm__ volatile("wfe");
+	}
+}
+
+/* Hold volume-up during the window to boot iOS; otherwise go back to Android. */
+static void
+fuxi_dual_boot(void)
+{
+	for (unsigned i = 0; i < 600; i++) {
+		if (fuxi_vol_up()) {
+			return;
+		}
+		for (volatile int d = 0; d < 200000; d++) {
+		}
+	}
+	fuxi_psci_reset();
+}
+
 void loader_main(uintptr_t fdt)
 {
  probe_main(fdt);
@@ -219,6 +318,10 @@ void loader_main(uintptr_t fdt)
   con_fb=0; /* USB diagnostics also work without a usable inherited scanout. */
  con_clear(BLUE);
  con_str("FUXI", "XNU loader + USB monitor");
+ {uint8_t rt=0; int apid=fk_find_apid(FK_GPIO_PPID); int ok=fk_read8(apid,0x10,&rt);
+  con_hex("APID",(uintptr_t)apid); con_hex("RT",(uintptr_t)rt); con_hex("OK",(uintptr_t)ok);
+  con_str("HOLD", fuxi_vol_up() ? "volume-up = iOS" : "no key -> Android");}
+ fuxi_dual_boot();
  const char *error=loader_boot();
  con_str("ERROR", error);
  for (unsigned i=0;i<sizeof(monitor_error)-1 && error[i];i++) monitor_error[i]=error[i];

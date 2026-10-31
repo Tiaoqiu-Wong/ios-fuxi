@@ -4,7 +4,7 @@
  * one bounded retry ONLY for the unserviced x0 == original function ID case.
  */
 #define G5_META_PA (G_MEM + 0x1600000)
-#define G5_META_BYTES 0x2000u
+#define G5_META_BYTES 0x4000u
 #define G5_ZAP_PA 0x9b09a000ULL /* sm8550.dtsi AND Fuxi live DT, no-map */
 #define G5_ZAP_BYTES 0x2000u
 #define G5_PAS 13u
@@ -145,7 +145,7 @@ static int g5_pas(uint32_t *d, const uint8_t *fw, const struct g5_plan *p)
  if (!g5_scm(d, 0x42000601, 1, 0x02000201, 0, 0, 1)) return 0xf05;
  if (!g5_copy(G5_META_PA, 0, G5_META_BYTES) ||
      !g5_copy(G5_META_PA, fw, p->header) ||
-     !g5_copy(G5_META_PA+p->header, fw+p->hash_off, p->hash_size)) return 0xf09;
+     !g5_copy(G5_META_PA+p->hash_off, fw+p->hash_off, p->hash_size)) return 0xf09;
  if (!g5_scm(d, G5_SMC(1), 0x82, G5_PAS, G5_META_PA, 0, 0)) return 0xf07;
  d[3] = 6;
  /* Linux qcom_mdt_pas_init: any valid relocatable LOAD enables setup;
