@@ -742,7 +742,7 @@
 +#endif
 --- a/bsd/dev/gpu-zap.h
 +++ b/bsd/dev/gpu-zap.h
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,283 @@
 +/* Qualcomm PAS13, Linux6.12 mdt_loader + qcom_scm ARM64 ABI.
 + * Included after gpu_m4. All input remains in the optional, external MBN.
 + * No WAITQ, interrupted-call continuation or TRUST MMIO writes. XNU permits
@@ -901,8 +901,16 @@
 +      KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +   return 0xf07;
 +  }
-+  memcpy((void *)meta_va, fw, p->header);
-+  memcpy((void *)(meta_va + p->hash_off), fw + p->hash_off, p->hash_size);
++  /* fw lives in NC memory: byte copies keep the kernel from issuing a
++   * wide unaligned load there, which faults. */
++  volatile uint8_t *dst = (volatile uint8_t *)meta_va;
++  const volatile uint8_t *src = (const volatile uint8_t *)fw;
++  for (unsigned i = 0; i < p->header; i++) {
++   dst[i] = src[i];
++  }
++  for (unsigned i = 0; i < p->hash_size; i++) {
++   dst[p->hash_off + i] = src[p->hash_off + i];
++  }
 +  flush_dcache((vm_offset_t)meta_va, G5_META_BYTES, 0);
 +  meta_pa = (uint64_t)pmap_find_phys(kernel_pmap, (addr64_t)meta_va) << PAGE_SHIFT;
 +  if (!meta_pa) {

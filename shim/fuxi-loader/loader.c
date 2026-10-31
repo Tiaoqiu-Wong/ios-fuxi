@@ -209,19 +209,26 @@ static const char *loader_boot(void)
 }
 
 
-/* ---------------- dual-boot key check (SPMI PMIC arbiter v7, EE 0) ----------------
+/* ---------------- dual boot: volume-up selects iOS ----------------
  * The kernel's sweet_spmi.c reads PMIC registers through the arbiter's observer
  * channel; the same sequence works here because the loader runs with the
- * firmware's identity map still active, so the SPMI windows are directly
- * accessible.  Volume-up (PM8550 SID 1 GPIO6, RT_STS bit 0, active low) is
- * sampled for a few seconds: held means "boot iOS", otherwise the loader
- * resets the SoC so ABL continues into Android.
+ * firmware's identity map still active.  Volume-up (PM8550 SID 1 GPIO6, RT_STS
+ * bit 0, active low) is sampled while a countdown runs: held means "boot iOS",
+ * otherwise the loader resets the SoC and ABL continues into Android.
+ *
+ * Build with -DFUXI_DUAL_BOOT=1 for the menu image; the default image boots
+ * straight into iOS so the automated runs are unaffected.
  */
+#ifndef FUXI_DUAL_BOOT
+#define FUXI_DUAL_BOOT 0
+#endif
+
 #define FK_CORE_PA  0x0c400000ull
 #define FK_CNFG_PA  0x0c42d000ull
 #define FK_OBS_PA   0x0c440000ull
 #define FK_MAP_OFF  0x2000u
 #define FK_GPIO_PPID 0x18du
+#define FK_PON_PPID  0x013u
 
 static uint32_t
 fk_rd(uintptr_t base, uint32_t off)
@@ -273,11 +280,27 @@ fk_read8(int apid, uint8_t reg, uint8_t *out)
 	return 0;
 }
 
+static uint64_t
+fuxi_now(void)
+{
+	uint64_t v;
+	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));
+	return v;
+}
+
+static uint64_t
+fuxi_freq(void)
+{
+	uint64_t v;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+	return v;
+}
+
 static int
-fuxi_vol_up(void)
+fuxi_vol_up(int apid)
 {
 	uint8_t rt = 0;
-	if (!fk_read8(fk_find_apid(FK_GPIO_PPID), 0x10, &rt)) {
+	if (!fk_read8(apid, 0x10, &rt)) {
 		return 0;
 	}
 	return (rt & 1u) == 0;      /* GPIO6 is active low */
@@ -293,19 +316,37 @@ fuxi_psci_reset(void)
 	}
 }
 
-/* Hold volume-up during the window to boot iOS; otherwise go back to Android. */
 static void
 fuxi_dual_boot(void)
 {
-	return;	/* dual boot disabled while bringing up drivers */
-	for (unsigned i = 0; i < 600; i++) {
-		if (fuxi_vol_up()) {
-			return;
+#if FUXI_DUAL_BOOT
+	int gpid = fk_find_apid(FK_GPIO_PPID);
+	uint64_t freq = fuxi_freq();
+	unsigned seconds = 8;
+
+	con_str("BOOT MENU", "hold VOL+ for iOS; timeout -> Android");
+	while (seconds > 0) {
+		con_hex("CONTINUE IN", (uintptr_t)seconds);
+		uint64_t until = fuxi_now() + freq;
+		while (fuxi_now() < until) {
+			if (fuxi_vol_up(gpid)) {
+				con_str("BOOT MENU", "volume-up held: starting iOS");
+				return;
+			}
+			__asm__ volatile("yield");
 		}
-		for (volatile int d = 0; d < 200000; d++) {
-		}
+		seconds--;
 	}
+	con_str("BOOT MENU", "no key: resetting into Android");
 	fuxi_psci_reset();
+#else
+	(void)fk_find_apid;
+	(void)fk_read8;
+	(void)fuxi_vol_up;
+	(void)fuxi_psci_reset;
+	(void)fuxi_now;
+	(void)fuxi_freq;
+#endif
 }
 
 void loader_main(uintptr_t fdt)
@@ -321,7 +362,7 @@ void loader_main(uintptr_t fdt)
  con_str("FUXI", "XNU loader + USB monitor");
  {uint8_t rt=0; int apid=fk_find_apid(FK_GPIO_PPID); int ok=fk_read8(apid,0x10,&rt);
   con_hex("APID",(uintptr_t)apid); con_hex("RT",(uintptr_t)rt); con_hex("OK",(uintptr_t)ok);
-  con_str("HOLD", fuxi_vol_up() ? "volume-up = iOS" : "no key -> Android");}
+  con_str("HOLD", fuxi_vol_up(fk_find_apid(FK_GPIO_PPID)) ? "volume-up = iOS" : "no key -> Android");}
  fuxi_dual_boot();
  const char *error=loader_boot();
  con_str("ERROR", error);
