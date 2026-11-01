@@ -94,15 +94,22 @@ static void stage_gpu_firmware(void)
  * own DMA allocation; the root volume is not involved. */
 #define WL_FW_PA 0x9fe000000ull
 #define WL_FW_HANDOFF 0x4000ull
-#define WL_FW_MAX 0x700000ull
+#define WL_FW_MAX 0xe00000ull
+
+struct wl_fw_file {
+ uint32_t offset;
+ uint32_t bytes;
+ uint64_t hash;
+ uint8_t name[24];
+};
 
 struct wl_fw_handoff {
  uint8_t magic[8];
  uint32_t version;
- uint32_t bytes;
- uint64_t hash;
+ uint32_t count;
  uint32_t reserved;
  uint32_t pad;
+ struct wl_fw_file file[4];
 };
 
 static uint64_t wl_fw_hash(const uint8_t *p, unsigned n)
@@ -116,19 +123,38 @@ static void stage_wlan_firmware(void)
 {
  static const uint8_t magic[8] = {'F','U','X','I','W','L','F','W'};
  extern const uint8_t _wlan_fw_start[], _wlan_fw_end[];
+ extern const uint8_t _wlan_amss_start[], _wlan_amss_end[];
+ extern const uint8_t _wlan_regdb_start[], _wlan_regdb_end[];
+ extern const uint8_t _wlan_bdf_start[], _wlan_bdf_end[];
+ extern const uint8_t _wlan_m3_start[], _wlan_m3_end[];
  volatile struct wl_fw_handoff *h = (volatile struct wl_fw_handoff *)WL_FW_PA;
  volatile uint8_t *dst = (volatile uint8_t *)(WL_FW_PA + WL_FW_HANDOFF);
- unsigned n = (unsigned)((uintptr_t)_wlan_fw_end - (uintptr_t)_wlan_fw_start);
- h->magic[0] = 0; h->magic[1] = 0; h->magic[2] = 0; h->magic[3] = 0;
- h->magic[4] = 0; h->magic[5] = 0; h->magic[6] = 0; h->magic[7] = 0;
- if (!n || n > WL_FW_MAX) return;
- for (unsigned i = 0; i < n; i++) dst[i] = _wlan_fw_start[i];
+ uintptr_t base = (uintptr_t)_wlan_fw_start;
+ unsigned total = (unsigned)((uintptr_t)_wlan_fw_end - base);
+ for (unsigned i = 0; i < sizeof(magic); i++) ((volatile uint8_t *)h)[i] = 0;
+ if (!total || total > WL_FW_MAX) return;
+ for (unsigned i = 0; i < total; i++) dst[i] = _wlan_fw_start[i];
  __asm__ volatile("dsb sy" ::: "memory");
- h->version = 1; h->bytes = n; h->reserved = 0;
- h->hash = wl_fw_hash((const uint8_t *)dst, n);
+ unsigned v = 0;
+ for (unsigned i = 0; i < 4; i++) {
+  uintptr_t s = 0, e = 0; const char *n = "";
+  switch (i) {
+   case 0: s = (uintptr_t)_wlan_amss_start; e = (uintptr_t)_wlan_amss_end; n = "amss20.bin"; break;
+   case 1: s = (uintptr_t)_wlan_regdb_start; e = (uintptr_t)_wlan_regdb_end; n = "regdb_xiaomi.bin"; break;
+   case 2: s = (uintptr_t)_wlan_bdf_start; e = (uintptr_t)_wlan_bdf_end; n = "bd_m3gl.elf"; break;
+   case 3: s = (uintptr_t)_wlan_m3_start; e = (uintptr_t)_wlan_m3_end; n = "m3.bin"; break;
+  }
+  unsigned bytes = (unsigned)(e - s);
+  if (!bytes) continue;
+  h->file[v].offset = (uint32_t)(s - base);
+  h->file[v].bytes = bytes;
+  h->file[v].hash = wl_fw_hash((const uint8_t *)s, bytes);
+  for (unsigned c = 0; c < sizeof(h->file[v].name) && n[c]; c++) h->file[v].name[c] = n[c];
+  v++;
+ }
+ h->version = 2; h->count = v; h->reserved = 0;
  __asm__ volatile("dsb sy" ::: "memory");
- h->magic[0] = magic[0]; h->magic[1] = magic[1]; h->magic[2] = magic[2]; h->magic[3] = magic[3];
- h->magic[4] = magic[4]; h->magic[5] = magic[5]; h->magic[6] = magic[6]; h->magic[7] = magic[7];
+ for (unsigned i = 0; i < sizeof(magic); i++) ((volatile uint8_t *)h)[i] = magic[i];
  __asm__ volatile("dsb sy" ::: "memory");
 }
 
