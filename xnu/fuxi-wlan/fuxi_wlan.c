@@ -2765,16 +2765,25 @@ wl_read_firmware(void)
 	vnode_t root = NULL, vp = NULL;
 	vfs_context_t ctx = vfs_context_kernel();
 	printf("FUXI WLAN: wait root <=120 s, firmware %s\n", wl_fw_path);
+	int e = ENOENT;
 	for (unsigned i = 0; i <= 1200; i++) {
 		root = vfs_rootvnode();
-		if (root) { break; }
+		if (root) {
+			vnode_put(root);
+			/* The root vnode exists before HFS has mounted over it, and this
+			 * thread runs that early: the file is what must be waited for.
+			 * Keep asking until the mount has happened (or the bound ends). */
+			e = vnode_open(wl_fw_path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
+			if (e == 0) { break; }
+			if (e != ENOENT && e != ENOTDIR && e != ENXIO && e != EBUSY) {
+				printf("FUXI WLAN: firmware open failed errno %d\n", e);
+				return 2;
+			}
+		}
 		if (i < 1200) { wl_sleep(100); }
 	}
-	if (!root) { return 1; }
-	vnode_put(root);
-	int e = vnode_open(wl_fw_path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
-	if (e) {
-		printf("FUXI WLAN: firmware open failed errno %d\n", e);
+	if (e != 0) {
+		printf("FUXI WLAN: firmware %s still missing after 120 s (errno %d)\n", wl_fw_path, e);
 		return 2;
 	}
 	struct vnode_attr a;
