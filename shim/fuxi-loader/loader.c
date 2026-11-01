@@ -92,7 +92,7 @@ static void stage_gpu_firmware(void)
  * scratch but at its base, with a handoff whose magic is published last. The
  * driver maps the window, checks the FNV-1a hash and copies the image into its
  * own DMA allocation; the root volume is not involved. */
-#define WL_FW_PA 0x9fe000000ull
+#define WL_FW_PA 0x9ff000000ull
 #define WL_FW_HANDOFF 0x4000ull
 #define WL_FW_MAX 0x700000ull
 

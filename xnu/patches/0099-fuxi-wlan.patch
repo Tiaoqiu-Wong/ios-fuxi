@@ -2795,7 +2795,7 @@
 + * every XNU memory window, with this handoff (magic published last). The driver
 + * copies it into its own DMA allocation, so no file system is needed. Keep the
 + * root-file path as the fallback for loaders that stage nothing. */
-+#define WL_STAGED_PA 0x9fe000000ull
++#define WL_STAGED_PA 0x9ff000000ull
 +#define WL_STAGED_IMAGE 0x4000u
 +#define WL_STAGED_MAX 0x700000u
 +#define WL_HASH_SEED 0xcbf29ce484222325ull
