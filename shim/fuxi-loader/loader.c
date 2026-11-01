@@ -227,7 +227,8 @@ static const char *loader_boot(void)
 #define FK_CNFG_PA  0x0c42d000ull
 #define FK_OBS_PA   0x0c440000ull
 #define FK_MAP_OFF  0x2000u
-#define FK_GPIO_PPID 0x18du
+#define FK_GPIO_PPID 0x18du        /* SID 1 GPIO6 = volume up */
+#define FK_GPIO5_PPID 0x18cu       /* SID 1 GPIO5 = volume down */
 #define FK_PON_PPID  0x013u
 
 static uint32_t
@@ -320,25 +321,31 @@ static void
 fuxi_dual_boot(void)
 {
 #if FUXI_DUAL_BOOT
-	int gpid = fk_find_apid(FK_GPIO_PPID);
+	int up = fk_find_apid(FK_GPIO_PPID);
+	int down = fk_find_apid(FK_GPIO5_PPID);
 	uint64_t freq = fuxi_freq();
-	unsigned seconds = 8;
+	unsigned seconds = 15;
 
-	con_str("BOOT MENU", "hold VOL+ for iOS; timeout -> Android");
+	/* Interactive, no key held at power-on: volume-up boots iOS, volume-down
+	 * returns to Android, and doing nothing boots iOS. */
+	con_str("BOOT MENU", "VOL+ = iOS   VOL- = Android   (15 s, default iOS)");
 	while (seconds > 0) {
-		con_hex("CONTINUE IN", (uintptr_t)seconds);
+		con_hex("SECONDS", (uintptr_t)seconds);
 		uint64_t until = fuxi_now() + freq;
 		while (fuxi_now() < until) {
-			if (fuxi_vol_up(gpid)) {
-				con_str("BOOT MENU", "volume-up held: starting iOS");
+			if (fuxi_vol_up(up)) {
+				con_str("BOOT MENU", "volume-up: starting iOS");
 				return;
+			}
+			if (fuxi_vol_up(down)) {
+				con_str("BOOT MENU", "volume-down: resetting into Android");
+				fuxi_psci_reset();
 			}
 			__asm__ volatile("yield");
 		}
 		seconds--;
 	}
-	con_str("BOOT MENU", "no key: resetting into Android");
-	fuxi_psci_reset();
+	con_str("BOOT MENU", "no key: starting iOS (default)");
 #else
 	(void)fk_find_apid;
 	(void)fk_read8;
