@@ -893,7 +893,7 @@
 +  * TrustZone call is refused. */
 + if (!g5_copy(G5_META_PA, 0, G5_META_BYTES) ||
 +     !g5_copy(G5_META_PA, fw, p->header) ||
-+     !g5_copy(G5_META_PA+p->hash_off, fw+p->hash_off, p->hash_size)) return 0xf09;
++     !g5_copy(G5_META_PA+p->header, fw+p->hash_off, p->hash_size)) return 0xf09;
 + if (!g5_scm(d, G5_SMC(1), 0x82, G5_PAS, G5_META_PA, 0, 0)) {
 +  vm_offset_t meta_va = 0;
 +  uint64_t meta_pa = 0;
@@ -901,15 +901,16 @@
 +      KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +   return 0xf07;
 +  }
-+  /* fw lives in NC memory: byte copies keep the kernel from issuing a
-+   * wide unaligned load there, which faults. */
-+  volatile uint8_t *dst = (volatile uint8_t *)meta_va;
-+  const volatile uint8_t *src = (const volatile uint8_t *)fw;
-+  for (unsigned i = 0; i < p->header; i++) {
-+   dst[i] = src[i];
++  /* fw lives in NC memory: 32-bit helper loads/stores keep the compiler from
++   * emitting a wide unaligned memmove from that mapping, which faults. The
++   * metadata is packed the way Linux qcom_mdt_read_metadata builds it: the ELF
++   * header immediately followed by the hash segment (no padding). */
++  volatile uint32_t *dst = (volatile uint32_t *)meta_va;
++  for (unsigned i = 0; i < p->header; i += 4) {
++   dst[i >> 2] = cdb32(fw + i);
 +  }
-+  for (unsigned i = 0; i < p->hash_size; i++) {
-+   dst[p->hash_off + i] = src[p->hash_off + i];
++  for (unsigned i = 0; i < p->hash_size; i += 4) {
++   dst[(p->header + i) >> 2] = cdb32(fw + p->hash_off + i);
 +  }
 +  flush_dcache((vm_offset_t)meta_va, G5_META_BYTES, 0);
 +  meta_pa = (uint64_t)pmap_find_phys(kernel_pmap, (addr64_t)meta_va) << PAGE_SHIFT;
