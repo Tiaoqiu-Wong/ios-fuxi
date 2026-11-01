@@ -13,9 +13,6 @@ cd "$(dirname "$0")"
 : "${FUXI_SQE_FIRMWARE:=}"
 : "${FUXI_GPU_ZAP_MBN:=}"
 : "${FUXI_WLAN_FW:=}"
-: "${FUXI_WLAN_REGDB:=}"
-: "${FUXI_WLAN_BDF:=}"
-: "${FUXI_WLAN_M3:=}"
 for input in "$MKBOOTIMG"; do
  [[ $input == /* && -f $input ]] || { echo 'Packing inputs must be existing absolute file paths' >&2; exit 1; }
 done
@@ -67,25 +64,18 @@ FWPY
 
 # Wi-Fi firmware for the real driver (amss20.bin): embedded like the GPU
 # firmware and staged by loader.c outside every XNU memory window.
-python3 - "$FUXI_WLAN_FW" "$FUXI_WLAN_REGDB" "$FUXI_WLAN_BDF" "$FUXI_WLAN_M3" "$out/wlan-fw.S" <<'WLFWPY'
+python3 - "$FUXI_WLAN_FW" "$out/wlan-fw.S" <<'WLFWPY'
 import json, pathlib, sys
-srcs = list(zip(('amss', 'regdb', 'bdf', 'm3'), sys.argv[1:5]))
-dst = sys.argv[5]
+src, dst = sys.argv[1], sys.argv[2]
 lines = ['.section .wl_fw,"a"', '.balign 4', '.global _wlan_fw_start', '_wlan_fw_start:']
-total = 0
-for name, src in srcs:
-    lines += ['.global _wlan_%s_start' % name, '_wlan_%s_start:' % name]
-    if src:
-        path = pathlib.Path(src).resolve(strict=True)
-        size = path.stat().st_size
-        assert path.is_file() and 0 < size <= 0x800000, 'invalid wlan %s size' % name
-        lines.append('.incbin ' + json.dumps(str(path)))
-        total += size
-        print('embedded wlan %s %s %d bytes' % (name, path.name, size))
-    lines += ['.global _wlan_%s_end' % name, '_wlan_%s_end:' % name]
+if src:
+    path = pathlib.Path(src).resolve(strict=True)
+    size = path.stat().st_size
+    assert path.is_file() and 0x1000 < size <= 0x700000, 'invalid wlan firmware size'
+    lines.append('.incbin ' + json.dumps(str(path)))
+    print('embedded wlan firmware %s %d bytes' % (path.name, size))
 lines += ['.global _wlan_fw_end', '_wlan_fw_end:']
 pathlib.Path(dst).write_text('\n'.join(lines) + '\n')
-print('wlan firmware total %d bytes' % total)
 WLFWPY
 # incbin avoids C absolute pointers in an Image loaded at an arbitrary PA.
 printf '.section .payload,"a"\n.incbin "%s"\n' "$payload" > "$out/payload.S"
@@ -115,7 +105,7 @@ sections = subprocess.check_output([sys.argv[2], '-SW', sys.argv[1]], text=True)
 match = re.search(r'\.wl_fw\s+PROGBITS\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+([0-9a-fA-F]+)', sections)
 assert match, 'loader has no .wl_fw section (build without FUXI_WLAN_FW?)'
 size = int(match[1], 16)
-assert size == 0 or 0x1000 < size <= 0xe00000, 'bad .wl_fw size %#x' % size
+assert size == 0 or 0x1000 < size <= 0x700000, 'bad .wl_fw size %#x' % size
 print('Verified loader .wl_fw size %#x' % size)
 WLCHECK
 "$OBJCOPY" -O binary "$out/loader.elf" "$out/Image"

@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5151 @@
+@@ -0,0 +1,5092 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -2797,94 +2797,51 @@
 + * root-file path as the fallback for loaders that stage nothing. */
 +#define WL_STAGED_PA 0x9fe000000ull
 +#define WL_STAGED_IMAGE 0x4000u
-+#define WL_STAGED_MAX 0xe00000u
++#define WL_STAGED_MAX 0x700000u
 +#define WL_HASH_SEED 0xcbf29ce484222325ull
-+
-+struct wl_staged_file {
-+	uint32_t offset;
-+	uint32_t bytes;
-+	uint64_t hash;
-+	uint8_t name[24];
-+};
 +
 +struct wl_staged_handoff {
 +	uint8_t magic[8];
 +	uint32_t version;
-+	uint32_t count;
++	uint32_t bytes;
++	uint64_t hash;
 +	uint32_t reserved;
 +	uint32_t pad;
-+	struct wl_staged_file file[4];
 +};
 +
 +/* Mapped cacheable with the other windows before the steps run. */
-+static struct fw_window wl_staged_window = { WL_STAGED_PA, 0x1000000ull, 0 };
++static struct fw_window wl_staged_window = { WL_STAGED_PA, 0x800000ull, 0 };
 +
 +/* Bytes the loader staged, or 0 when there is none or its hash disagrees. */
-+/* The handoff the loader publishes, or NULL when it staged nothing valid. */
-+static const struct wl_staged_handoff *
-+wl_staged_handoff(void)
++static unsigned
++wl_staged_firmware(void)
 +{
 +	static const uint8_t magic[8] = { 'F', 'U', 'X', 'I', 'W', 'L', 'F', 'W' };
 +	const struct wl_staged_handoff *h;
++	const uint8_t *image;
++	unsigned bytes;
 +
 +	if (!wl_staged_window.va) {
-+		return NULL;
++		return 0;
 +	}
 +	h = (const struct wl_staged_handoff *)wl_staged_window.va;
 +	for (unsigned i = 0; i < sizeof(magic); i++) {
 +		if (h->magic[i] != magic[i]) {
-+			return NULL;
++			return 0;
 +		}
 +	}
-+	if (h->version != 2 || h->count == 0 || h->count > 4) {
-+		printf("FUXI WLAN: staged handoff invalid (version %u files %u)\n", h->version, h->count);
-+		return NULL;
++	bytes = h->bytes;
++	if (h->version != 1 || bytes < WL_CHUNK || bytes > WL_STAGED_MAX ||
++	    bytes > wl_staged_window.size - WL_STAGED_IMAGE) {
++		printf("FUXI WLAN: staged firmware handoff invalid (version %u bytes %u)\n", h->version, h->bytes);
++		return 0;
 +	}
-+	return h;
-+}
-+
-+/* One staged file by base name; hash-checked against the loader's copy. */
-+static const uint8_t *
-+wl_staged_file(const char *name, unsigned *bytes)
-+{
-+	const struct wl_staged_handoff *h = wl_staged_handoff();
-+	const char *base = name;
-+	unsigned len;
-+
-+	if (h == NULL || name == NULL) {
-+		return NULL;
++	image = (const uint8_t *)(wl_staged_window.va + WL_STAGED_IMAGE);
++	if (wl_hash_bytes(WL_HASH_SEED, image, bytes) != h->hash) {
++		printf("FUXI WLAN: staged firmware %u bytes hash mismatch, ignored\n", bytes);
++		return 0;
 +	}
-+	for (const char *p = name; *p; p++) {
-+		if (*p == '/') {
-+			base = p + 1;
-+		}
-+	}
-+	len = (unsigned)strlen(base);
-+	if (len == 0 || len >= sizeof(h->file[0].name)) {
-+		return NULL;
-+	}
-+	for (unsigned i = 0; i < h->count; i++) {
-+		const struct wl_staged_file *f = &h->file[i];
-+		const uint8_t *image;
-+
-+		if (memcmp(f->name, base, len) || f->name[len] != 0) {
-+			continue;
-+		}
-+		if (!f->bytes || f->bytes > WL_STAGED_MAX ||
-+		    f->offset > wl_staged_window.size - WL_STAGED_IMAGE ||
-+		    f->bytes > wl_staged_window.size - WL_STAGED_IMAGE - f->offset) {
-+			printf("FUXI WLAN: staged %s bounds invalid\n", base);
-+			return NULL;
-+		}
-+		image = (const uint8_t *)(wl_staged_window.va + WL_STAGED_IMAGE + f->offset);
-+		if (wl_hash_bytes(WL_HASH_SEED, image, f->bytes) != f->hash) {
-+			printf("FUXI WLAN: staged %s %u bytes hash mismatch, ignored\n", base, f->bytes);
-+			return NULL;
-+		}
-+		*bytes = f->bytes;
-+		return image;
-+	}
-+	return NULL;
++	return bytes;
 +}
 +
 +static int
@@ -2892,8 +2849,8 @@
 +{
 +	vnode_t root = NULL, vp = NULL;
 +	vfs_context_t ctx = vfs_context_kernel();
-+	unsigned staged = 0;
-+	const uint8_t *staged_image = wl_staged_file(wl_fw_path, &staged);
++	unsigned staged = wl_staged_firmware();
++	const uint8_t *staged_image = staged ? (const uint8_t *)(wl_staged_window.va + WL_STAGED_IMAGE) : NULL;
 +	int e = 0;
 +
 +	if (staged_image != NULL) {
@@ -4361,23 +4318,7 @@
 +wl14_read(const char *name, struct wl_dma *d, unsigned limit, unsigned *size)
 +{
 +	char path[128]; vnode_t vp = NULL; vfs_context_t ctx = vfs_context_kernel();
-+	unsigned staged_bytes = 0;
-+	const uint8_t *staged = wl_staged_file(name, &staged_bytes);
 +	if (!wl14_basename(name)) { return wl_w11_fail("W14 invalid firmware basename"); }
-+	if (staged != NULL) {
-+		/* Same follow-up as the file path: the download reads d->va and the device
-+		 * reads the buffer through its IOVA, never this staged copy directly. */
-+		if (!staged_bytes || staged_bytes > limit) { return wl_w11_fail("W14 staged size"); }
-+		*size = staged_bytes;
-+		if (d == &wl14_m3) {
-+			uint64_t align = wl13_alignment(*size);
-+			wl_iova_next = (wl_iova_next+align-1) & ~(align-1);
-+		}
-+		if (d->va || wl_dma_alloc(d, *size)) { return wl_w11_fail("W14 staged allocation"); }
-+		memcpy((void *)d->va, staged, *size);
-+		printf("FUXI WLAN: W14 file %s bytes %u from the loader staging\n", name, *size);
-+		return wl_w11_guard();
-+	}
 +	snprintf(path, sizeof(path), "/usr/local/share/fuxi/wlan/%s", name);
 +	int e = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
 +	if (e) {
