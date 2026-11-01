@@ -771,7 +771,7 @@
 +/* W14 inputs are retained through keep/containment, including partial reads. */
 +static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3;
 +static char wl14_bdf_name[65]; /* one extra byte detects XNU string truncation */
-+#define WL14_FILE_MAX (1024u * 1024u)
++#define WL14_FILE_MAX (4u * 1024u * 1024u)
 +#define WL14_M3_MAX (2u * 1024u * 1024u)
 +#define WL14_SEG 6144u
 +static bool
