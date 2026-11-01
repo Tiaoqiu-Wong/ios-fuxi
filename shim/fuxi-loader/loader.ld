@@ -16,6 +16,7 @@ SECTIONS {
  _secondary_stack_top = .;
  _payload_start = .;
  .payload : { *(.payload) }
+ .wl_fw : { *(.wl_fw) }
  _payload_end = .;
  _image_end = .;
  _end = .;

@@ -12,6 +12,7 @@ cd "$(dirname "$0")"
 : "${FUXI_GMU_FIRMWARE:=}"
 : "${FUXI_SQE_FIRMWARE:=}"
 : "${FUXI_GPU_ZAP_MBN:=}"
+: "${FUXI_WLAN_FW:=}"
 for input in "$MKBOOTIMG"; do
  [[ $input == /* && -f $input ]] || { echo 'Packing inputs must be existing absolute file paths' >&2; exit 1; }
 done
@@ -60,6 +61,22 @@ for src, name in ((gmu, 'gpu'), (sqe, 'sqe'), (zap, 'zap')):
     lines += [f'.global _{name}_fw_end', f'_{name}_fw_end:']
 pathlib.Path(dst).write_text('\n'.join(lines) + '\n')
 FWPY
+
+# Wi-Fi firmware for the real driver (amss20.bin): embedded like the GPU
+# firmware and staged by loader.c outside every XNU memory window.
+python3 - "$FUXI_WLAN_FW" "$out/wlan-fw.S" <<'WLFWPY'
+import json, pathlib, sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = ['.section .wl_fw,"a"', '.balign 4', '.global _wlan_fw_start', '_wlan_fw_start:']
+if src:
+    path = pathlib.Path(src).resolve(strict=True)
+    size = path.stat().st_size
+    assert path.is_file() and 0x1000 < size <= 0x700000, 'invalid wlan firmware size'
+    lines.append('.incbin ' + json.dumps(str(path)))
+    print('embedded wlan firmware %s %d bytes' % (path.name, size))
+lines += ['.global _wlan_fw_end', '_wlan_fw_end:']
+pathlib.Path(dst).write_text('\n'.join(lines) + '\n')
+WLFWPY
 # incbin avoids C absolute pointers in an Image loaded at an arbitrary PA.
 printf '.section .payload,"a"\n.incbin "%s"\n' "$payload" > "$out/payload.S"
 flags=(--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib
@@ -73,7 +90,8 @@ for source in start.S loader.c ../console.c ../fuxi-probe/probe.c; do
 done
 "$CLANG" "${flags[@]}" -c "$out/payload.S" -o "$out/payload.o"
 "$CLANG" "${flags[@]}" -c "$out/gpu-fw.S" -o "$out/gpu-fw.o"
-"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/gpu-fw.o" "$out/payload.o" -o "$out/loader.elf"
+"$CLANG" "${flags[@]}" -c "$out/wlan-fw.S" -o "$out/wlan-fw.o"
+"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/gpu-fw.o" "$out/wlan-fw.o" "$out/payload.o" -o "$out/loader.elf"
 python3 - "$out/loader.elf" "$READELF" <<'GPUCHECK'
 import re, subprocess, sys
 sections = subprocess.check_output([sys.argv[2], '-SW', sys.argv[1]], text=True)
@@ -81,6 +99,15 @@ match = re.search(r'\.gpu_fw\s+PROGBITS\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+([0-9a-f
 assert match and int(match[1], 16) >= 0x10000, 'loader .gpu_fw too small'  # [gpu-fw-relaxed]
 print('Verified loader .gpu_fw size ' + match[1])
 GPUCHECK
+python3 - "$out/loader.elf" "$READELF" <<'WLCHECK'
+import re, subprocess, sys
+sections = subprocess.check_output([sys.argv[2], '-SW', sys.argv[1]], text=True)
+match = re.search(r'\.wl_fw\s+PROGBITS\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+([0-9a-fA-F]+)', sections)
+assert match, 'loader has no .wl_fw section (build without FUXI_WLAN_FW?)'
+size = int(match[1], 16)
+assert size == 0 or 0x1000 < size <= 0x700000, 'bad .wl_fw size %#x' % size
+print('Verified loader .wl_fw size %#x' % size)
+WLCHECK
 "$OBJCOPY" -O binary "$out/loader.elf" "$out/Image"
 python3 - "$out/Image" <<'PY'
 import struct,sys

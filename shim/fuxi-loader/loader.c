@@ -88,6 +88,50 @@ static void stage_gpu_firmware(void)
  h->magic = FG_MAGIC;
 }
 
+/* The Wi-Fi driver's firmware (amss20.bin), staged in the same top-of-bank
+ * scratch but at its base, with a handoff whose magic is published last. The
+ * driver maps the window, checks the FNV-1a hash and copies the image into its
+ * own DMA allocation; the root volume is not involved. */
+#define WL_FW_PA 0x9fe000000ull
+#define WL_FW_HANDOFF 0x4000ull
+#define WL_FW_MAX 0x700000ull
+
+struct wl_fw_handoff {
+ uint8_t magic[8];
+ uint32_t version;
+ uint32_t bytes;
+ uint32_t hash;
+ uint32_t reserved;
+};
+
+static uint32_t wl_fw_hash(const uint8_t *p, unsigned n)
+{
+ uint32_t h = 2166136261u;
+ for (unsigned i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+ return h;
+}
+
+static void stage_wlan_firmware(void)
+{
+ static const uint8_t magic[8] = {'F','U','X','I','W','L','F','W'};
+ extern const uint8_t _wlan_fw_start[], _wlan_fw_end[];
+ volatile struct wl_fw_handoff *h = (volatile struct wl_fw_handoff *)WL_FW_PA;
+ volatile uint8_t *dst = (volatile uint8_t *)(WL_FW_PA + WL_FW_HANDOFF);
+ unsigned n = (unsigned)((uintptr_t)_wlan_fw_end - (uintptr_t)_wlan_fw_start);
+ h->magic[0] = 0; h->magic[1] = 0; h->magic[2] = 0; h->magic[3] = 0;
+ h->magic[4] = 0; h->magic[5] = 0; h->magic[6] = 0; h->magic[7] = 0;
+ if (!n || n > WL_FW_MAX) return;
+ for (unsigned i = 0; i < n; i++) dst[i] = _wlan_fw_start[i];
+ __asm__ volatile("dsb sy" ::: "memory");
+ h->version = 1; h->bytes = n; h->reserved = 0;
+ h->hash = wl_fw_hash((const uint8_t *)dst, n);
+ __asm__ volatile("dsb sy" ::: "memory");
+ h->magic[0] = magic[0]; h->magic[1] = magic[1]; h->magic[2] = magic[2]; h->magic[3] = magic[3];
+ h->magic[4] = magic[4]; h->magic[5] = magic[5]; h->magic[6] = magic[6]; h->magic[7] = magic[7];
+ __asm__ volatile("dsb sy" ::: "memory");
+}
+
+
 static int magic_ok(const char *m)
 {
 	static const char want[] = "SWEETXNU";
@@ -144,6 +188,7 @@ static const char *loader_boot(void)
        FG_SCRATCH < probe_fdt_address() + probe_fdt_bytes()))
    return "GPU reservation overlaps loader/FDT";
   stage_gpu_firmware();
+  stage_wlan_firmware();
  }
  monitor_report[MON_STAGE]=5;
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */

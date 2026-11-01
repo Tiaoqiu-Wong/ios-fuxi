@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5016 @@
+@@ -0,0 +1,5091 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -150,7 +150,7 @@
 +static uint64_t fw_mapped_bytes;
 +
 +static kern_return_t
-+fw_map_window(struct fw_window *w)
++fw_map_window(struct fw_window *w, unsigned cacheattr)
 +{
 +	vm_offset_t va = 0;
 +	if (!w->size || (w->pa & PAGE_MASK) || (w->size & PAGE_MASK) || w->va) {
@@ -163,7 +163,7 @@
 +	}
 +	for (vm_size_t off = 0; off < w->size; off += PAGE_SIZE) {
 +		kr = pmap_enter_options_addr(kernel_pmap, va + off, w->pa + off,
-+		    VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, VM_WIMG_IO, TRUE,
++		    VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, cacheattr, TRUE,
 +		    PMAP_OPTIONS_NOWAIT, NULL);
 +		if (kr != KERN_SUCCESS) {
 +			pmap_remove(kernel_pmap, va, va + w->size);
@@ -2791,58 +2791,125 @@
 +	return bad;
 +}
 +
++/* The XNU loader stages the Wi-Fi firmware in the top-of-bank scratch, outside
++ * every XNU memory window, with this handoff (magic published last). The driver
++ * copies it into its own DMA allocation, so no file system is needed. Keep the
++ * root-file path as the fallback for loaders that stage nothing. */
++#define WL_STAGED_PA 0x9fe000000ull
++#define WL_STAGED_IMAGE 0x4000u
++#define WL_STAGED_MAX 0x700000u
++#define WL_HASH_SEED 0xcbf29ce484222325ull
++
++struct wl_staged_handoff {
++	uint8_t magic[8];
++	uint32_t version;
++	uint32_t bytes;
++	uint32_t hash;
++	uint32_t reserved;
++};
++
++/* Mapped cacheable with the other windows before the steps run. */
++static struct fw_window wl_staged_window = { WL_STAGED_PA, 0x800000ull, 0 };
++
++/* Bytes the loader staged, or 0 when there is none or its hash disagrees. */
++static unsigned
++wl_staged_firmware(void)
++{
++	static const uint8_t magic[8] = { 'F', 'U', 'X', 'I', 'W', 'L', 'F', 'W' };
++	const struct wl_staged_handoff *h;
++	const uint8_t *image;
++	unsigned bytes;
++
++	if (!wl_staged_window.va) {
++		return 0;
++	}
++	h = (const struct wl_staged_handoff *)wl_staged_window.va;
++	for (unsigned i = 0; i < sizeof(magic); i++) {
++		if (h->magic[i] != magic[i]) {
++			return 0;
++		}
++	}
++	bytes = h->bytes;
++	if (h->version != 1 || bytes < WL_CHUNK || bytes > WL_STAGED_MAX ||
++	    bytes > wl_staged_window.size - WL_STAGED_IMAGE) {
++		printf("FUXI WLAN: staged firmware handoff invalid (version %u bytes %u)\n", h->version, h->bytes);
++		return 0;
++	}
++	image = (const uint8_t *)(wl_staged_window.va + WL_STAGED_IMAGE);
++	if (wl_hash_bytes(WL_HASH_SEED, image, bytes) != h->hash) {
++		printf("FUXI WLAN: staged firmware %u bytes hash mismatch, ignored\n", bytes);
++		return 0;
++	}
++	return bytes;
++}
++
 +static int
 +wl_read_firmware(void)
 +{
 +	vnode_t root = NULL, vp = NULL;
 +	vfs_context_t ctx = vfs_context_kernel();
-+	printf("FUXI WLAN: wait root <=120 s, firmware %s\n", wl_fw_path);
-+	int e = ENOENT;
-+	for (unsigned i = 0; i <= 1200; i++) {
-+		root = vfs_rootvnode();
-+		if (root) {
-+			vnode_put(root);
-+			/* The root vnode exists before HFS has mounted over it, and this
-+			 * thread runs that early: the file is what must be waited for.
-+			 * Keep asking until the mount has happened (or the bound ends). */
-+			e = vnode_open(wl_fw_path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
-+			if (e == 0) { break; }
-+			if (e != ENOENT && e != ENOTDIR && e != ENXIO && e != EBUSY) {
-+				printf("FUXI WLAN: firmware open failed errno %d\n", e);
-+				return 2;
++	unsigned staged = wl_staged_firmware();
++	const uint8_t *staged_image = staged ? (const uint8_t *)(wl_staged_window.va + WL_STAGED_IMAGE) : NULL;
++	int e = 0;
++
++	if (staged_image != NULL) {
++		printf("FUXI WLAN: firmware staged by the loader at PA %#llx, %u bytes (no root file needed)\n",
++		    WL_STAGED_PA, staged);
++	} else {
++		printf("FUXI WLAN: wait root <=120 s, firmware %s\n", wl_fw_path);
++		e = ENOENT;
++		for (unsigned i = 0; i <= 1200; i++) {
++			root = vfs_rootvnode();
++			if (root) {
++				vnode_put(root);
++				/* The root vnode exists before HFS has mounted over it, and this
++				 * thread runs that early: the file is what must be waited for.
++				 * Keep asking until the mount has happened (or the bound ends). */
++				e = vnode_open(wl_fw_path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
++				if (e == 0) { break; }
++				if (e != ENOENT && e != ENOTDIR && e != ENXIO && e != EBUSY) {
++					printf("FUXI WLAN: firmware open failed errno %d\n", e);
++					return 2;
++				}
 +			}
++			if (i < 1200) { wl_sleep(100); }
 +		}
-+		if (i < 1200) { wl_sleep(100); }
++		if (e != 0) {
++			printf("FUXI WLAN: firmware %s still missing after 120 s (errno %d)\n", wl_fw_path, e);
++			return 2;
++		}
++		struct vnode_attr a;
++		VATTR_INIT(&a); VATTR_WANTED(&a, va_data_size);
++		e = vnode_getattr(vp, &a, ctx);
++		if (e || vnode_vtype(vp) != VREG || !VATTR_IS_SUPPORTED(&a, va_data_size) ||
++		    a.va_data_size < WL_CHUNK || a.va_data_size > WL_FW_MAX) {
++			e = 3; goto close;
++		}
++		staged = (unsigned)a.va_data_size;
 +	}
-+	if (e != 0) {
-+		printf("FUXI WLAN: firmware %s still missing after 120 s (errno %d)\n", wl_fw_path, e);
-+		return 2;
-+	}
-+	struct vnode_attr a;
-+	VATTR_INIT(&a); VATTR_WANTED(&a, va_data_size);
-+	e = vnode_getattr(vp, &a, ctx);
-+	if (e || vnode_vtype(vp) != VREG || !VATTR_IS_SUPPORTED(&a, va_data_size) ||
-+	    a.va_data_size < WL_CHUNK || a.va_data_size > WL_FW_MAX) {
-+		e = 3; goto close;
-+	}
-+	wl_fw_size = (uint32_t)a.va_data_size;
++	wl_fw_size = staged;
++	if (wl_fw_path == NULL) { wl_fw_path = "loader"; }
 +	unsigned read_bytes = (wl_seq_flags & WL_O_PREFIX) ? WL_CHUNK : wl_fw_size;
 +	if (wl_dma_alloc(&wl_image, read_bytes)) { e = 4; goto close; }
-+	/* Keep the BHI prefix allocation independent, but read the full file once
-+	 * from this vnode for W10. Allocate/map everything before the doorbells;
-+	 * never reopen a possibly changed path after SBL starts. */
++	/* Keep the BHI prefix allocation independent, but take the full image once
++	 * for W10. Allocate/map everything before the doorbells; never reread a
++	 * possibly changed source after SBL starts. */
 +	struct wl_dma *input = &wl_image;
 +	if ((wl_seq_flags & WL_O_PREFIX) && !wl_stop22) {
 +		if (wl_dma_alloc(&wl_amss, wl_fw_size)) { e = 4; goto close; }
 +		input = &wl_amss; read_bytes = wl_fw_size;
 +	}
-+	int resid = 0;
-+	e = vn_rdwr(UIO_READ, vp, (caddr_t)input->va, (int)read_bytes, 0,
-+	    UIO_SYSSPACE, 0,
-+	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-+	if (e || resid) {
-+		printf("FUXI WLAN: firmware read errno %d residual %d\n", e, resid);
-+		e = 5; goto close;
++	if (staged_image != NULL) {
++		memcpy((void *)input->va, staged_image, read_bytes);
++	} else {
++		int resid = 0;
++		e = vn_rdwr(UIO_READ, vp, (caddr_t)input->va, (int)read_bytes, 0,
++		    UIO_SYSSPACE, 0,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (e || resid) {
++			printf("FUXI WLAN: firmware read errno %d residual %d\n", e, resid);
++			e = 5; goto close;
++		}
 +	}
 +	/* Qualcomm images need not be native ARM ELFs. Check ident, header size,
 +	 * version and bounded program table; do not reject vendor e_machine. */
@@ -2908,7 +2975,9 @@
 +	    b[0], b[1], b[2], b[3], b[4], phoff, phnum, WL_CHUNK);
 +	e = 0;
 +close:
-+	(void)vnode_close(vp, FREAD, ctx);
++	if (vp != NULL) {
++		(void)vnode_close(vp, FREAD, ctx);
++	}
 +	return e;
 +}
 +
@@ -5005,12 +5074,18 @@
 +	for (unsigned i = 0; i < FW_NWIN; i++) {
 +		if ((!wl_cnss || wl_variant_invalid) &&
 +		    (fw_windows[i].pa == WL_AOSS_QMP || fw_windows[i].pa == WL_AOSS_IPCC)) { continue; }
-+		kern_return_t kr = fw_map_window(&fw_windows[i]);
++		kern_return_t kr = fw_map_window(&fw_windows[i], VM_WIMG_IO);
 +		if (kr != KERN_SUCCESS) {
 +			printf("FUXI WLAN: map PA %#llx bytes %#llx failed %d\n",
 +			    fw_windows[i].pa, fw_windows[i].size, kr);
 +			goto out;
 +		}
++		mapped++;
++	}
++	/* The staged firmware window may be absent (no loader support, or the
++	 * mapping failed): step 19 then falls back to the file on the root. */
++	if (wl_staged_window.va == 0 &&
++	    fw_map_window(&wl_staged_window, VM_WIMG_DEFAULT) == KERN_SUCCESS) {
 +		mapped++;
 +	}
 +	printf("FUXI WLAN: mapped %llu bytes in %u windows; running steps 1..%u\n",
