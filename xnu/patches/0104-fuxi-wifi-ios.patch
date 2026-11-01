@@ -223,48 +223,6 @@
 +
 +OSDefineMetaClassAndStructors(FuxiWLAN, IONetworkInterface);
 +
-+/* wifid asks for a user client of type 0 before it will drive the radio. The
-+ * Apple80211 requests that matter already reach the SIOCGA80211 handler, so this
-+ * client exists to learn the call layout wifid uses, then to forward to it. */
-+class FuxiWLANUserClient : public IOUserClient
-+{
-+	OSDeclareDefaultStructors(FuxiWLANUserClient);
-+
-+public:
-+	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * arguments,
-+	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
-+};
-+
-+OSDefineMetaClassAndStructors(FuxiWLANUserClient, IOUserClient);
-+
-+IOReturn
-+FuxiWLANUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * arguments,
-+    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
-+{
-+	static unsigned said;
-+
-+	if (said++ < 24) {
-+		IOLog("FuxiWLANUserClient: selector %u scalar in %u out %u struct in %u out %u\n",
-+		    (unsigned) selector, arguments ? (unsigned) arguments->scalarInputCount : 0,
-+		    arguments ? (unsigned) arguments->scalarOutputCount : 0,
-+		    arguments ? (unsigned) arguments->structureInputSize : 0,
-+		    arguments ? (unsigned) arguments->structureOutputSize : 0);
-+		if (arguments != NULL && arguments->scalarInputCount > 0) {
-+			for (unsigned i = 0; i < arguments->scalarInputCount && i < 8; i++) {
-+				IOLog("FuxiWLANUserClient:   scalar[%u] = %#llx\n", i,
-+				    (unsigned long long) arguments->scalarInput[i]);
-+			}
-+		}
-+		if (arguments != NULL && arguments->structureInput != NULL &&
-+		    arguments->structureInputSize >= 8) {
-+			const uint32_t * w = (const uint32_t *) arguments->structureInput;
-+			IOLog("FuxiWLANUserClient:   struct %u bytes: %#x %#x %#x %#x\n",
-+			    (unsigned) arguments->structureInputSize, w[0], w[1], w[2], w[3]);
-+		}
-+	}
-+	return kIOReturnUnsupported;
-+}
-+
 +/* There is none (see the top); that somebody asked shows that the service was found. */
 +IOReturn
 +FuxiWLAN::newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties, IOUserClient ** handler)
@@ -272,17 +230,7 @@
 +	static unsigned said;
 +
 +	if (said++ < 8) {
-+		IOLog("FuxiWLAN: a user client of type %u is asked for\n", (unsigned) type);
-+	}
-+	if (type == 0 && handler != NULL) {
-+		FuxiWLANUserClient * client = OSTypeAlloc(FuxiWLANUserClient);
-+		if (client != NULL && client->initWithTask(owningTask, securityID, type, properties) &&
-+		    client->attach(this) && client->start(this)) {
-+			*handler = client;
-+			IOLog("FuxiWLAN: a probe user client of type 0 is attached\n");
-+			return kIOReturnSuccess;
-+		}
-+		OSSafeReleaseNULL(client);
++		IOLog("FuxiWLAN: a user client of type %u is asked for: there is none\n", (unsigned) type);
 +	}
 +	if (handler != NULL) {
 +		*handler = NULL;
