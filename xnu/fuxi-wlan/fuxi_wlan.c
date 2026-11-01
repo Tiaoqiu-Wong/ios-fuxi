@@ -2772,8 +2772,9 @@ struct wl_staged_handoff {
 	uint8_t magic[8];
 	uint32_t version;
 	uint32_t bytes;
-	uint32_t hash;
+	uint64_t hash;
 	uint32_t reserved;
+	uint32_t pad;
 };
 
 /* Mapped cacheable with the other windows before the steps run. */

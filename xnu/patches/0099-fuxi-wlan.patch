@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5091 @@
+@@ -0,0 +1,5092 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -2804,8 +2804,9 @@
 +	uint8_t magic[8];
 +	uint32_t version;
 +	uint32_t bytes;
-+	uint32_t hash;
++	uint64_t hash;
 +	uint32_t reserved;
++	uint32_t pad;
 +};
 +
 +/* Mapped cacheable with the other windows before the steps run. */

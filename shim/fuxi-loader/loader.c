@@ -100,14 +100,15 @@ struct wl_fw_handoff {
  uint8_t magic[8];
  uint32_t version;
  uint32_t bytes;
- uint32_t hash;
+ uint64_t hash;
  uint32_t reserved;
+ uint32_t pad;
 };
 
-static uint32_t wl_fw_hash(const uint8_t *p, unsigned n)
+static uint64_t wl_fw_hash(const uint8_t *p, unsigned n)
 {
- uint32_t h = 2166136261u;
- for (unsigned i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+ uint64_t h = 0xcbf29ce484222325ull;
+ for (unsigned i = 0; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
  return h;
 }
 
