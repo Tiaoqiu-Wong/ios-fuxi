@@ -2083,6 +2083,23 @@ wl_smmu_populate(void)
 	return fw_faults ? 1 : 0;
 }
 
+/* Add leaves for one late-allocated DMA buffer to the live SMMU tables.
+ * Same format as wl_smmu_populate(); the pool is disjoint per allocation. */
+static int
+wl_smmu_map_dma(struct wl_dma *d)
+{
+	if (!wl_enabled || !wl_tables.va || !d->va || !d->size) { return 1; }
+	for (vm_size_t off = 0; off < d->size; off += 4096) {
+		uint64_t addr = d->iova + off;
+		if (addr < wl_iova_base || addr >= wl_iova_end) { return 2; }
+		unsigned n = (unsigned)((addr - wl_iova_base) >> 21);
+		uint64_t *l3 = (uint64_t *)(wl_tables.va + (2 + n) * 4096);
+		l3[(addr >> 12) & 511] = wl_phys(d->va + off) | WL_DMA_PTE;
+	}
+	wl_dma_clean(&wl_tables);
+	return wl_smmu_sync(false) ? 1 : 0;
+}
+
 static int
 wl_smmu_enable(void)
 {
@@ -4543,6 +4560,7 @@ wl_w19_ce_rx(void)
 		printf("FUXI WLAN: W19 RX allocation failed\n");
 		return;
 	}
+	if (wl_smmu_map_dma(&wl19_rx)) { printf("FUXI WLAN: W19 RX SMMU mapping failed\n"); return; }
 	printf("FUXI WLAN: W19 RX buffers IOVA %#llx bytes %u\n", wl19_rx.iova, WL19_N * WL19_BUF);
 	wl19_post(1, WL19_N / 2); /* CE1 HTC control/HTT */
 	wl19_post(3, WL19_N / 2); /* CE2 WMI */
@@ -4569,6 +4587,7 @@ wl_w20_htc_tx(void)
 		printf("FUXI WLAN: W20 TX allocation failed\n");
 		return;
 	}
+	if (wl_smmu_map_dma(&wl20_tx)) { printf("FUXI WLAN: W20 TX SMMU mapping failed\n"); return; }
 	uint8_t *p = (uint8_t *)wl20_tx.va;
 	uint32_t hdr0 = (12u << 16);      /* endpoint 0, flags 0, payload 12 */
 	uint32_t hdr1 = 0;
@@ -4646,6 +4665,10 @@ wl_w18_ce_rings(void)
 	}
 	if (!wl18_rdp.va && wl_dma_alloc(&wl18_rdp, 4096)) {
 		printf("FUXI WLAN: W18 CE RDP page allocation failed\n");
+		return;
+	}
+	if (wl_smmu_map_dma(&wl18_rings) || wl_smmu_map_dma(&wl18_rdp)) {
+		printf("FUXI WLAN: W18 CE ring SMMU mapping failed\n");
 		return;
 	}
 	b = wl18_rings.iova;
