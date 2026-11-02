@@ -4535,35 +4535,6 @@ wl_w18_ce_rings(void)
 	printf("FUXI WLAN: W18 CE rings done faults %u\n", fw_faults);
 }
 
-static void
-wl_w18_ce_rings(void)
-{
-	unsigned ce0 = 16u * 16u, ce1 = 512u * 16u, ce1s = 512u * 4u,
-	    ce2 = 128u * 16u, ce2s = 128u * 4u, ce3 = 32u * 16u;
-	unsigned total = ce0 + ce1 + ce1s + ce2 + ce2s + ce3;
-	uint64_t b;
-
-	if (wl18_rings.va || wl_dma_alloc(&wl18_rings, total)) {
-		printf("FUXI WLAN: W18 CE ring allocation failed\n");
-		return;
-	}
-	b = wl18_rings.iova;
-	printf("FUXI WLAN: W18 CE rings IOVA %#llx total %u\n", b, total);
-	wl18_ring[0] = (struct wl_ce_ring){ b, (uint8_t *)wl18_rings.va, 16, 4, 0x1b80000u };
-	wl18_ring[1] = (struct wl_ce_ring){ b + ce0, (uint8_t *)wl18_rings.va + ce0, 512, 4, 0x1b81000u };
-	wl18_ring[2] = (struct wl_ce_ring){ b + ce0 + ce1, (uint8_t *)wl18_rings.va + ce0 + ce1, 512, 1, 0x1b81058u };
-	wl18_ring[3] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s, 128, 4, 0x1b85000u };
-	wl18_ring[4] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2, 128, 1, 0x1b85058u };
-	wl18_ring[5] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2 + ce2s, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2 + ce2s, 32, 4, 0x1b86000u };
-	wl_ce_ring_prog("CE0-SRC", 0x1b80000u, b, 16, 4, 64, false, 0x400); b += ce0;
-	wl_ce_ring_prog("CE1-DST", 0x1b81000u, b, 512, 4, 82, true, 0); b += ce1;
-	wl_ce_ring_prog("CE1-STA", 0x1b81058u, b, 512, 1, 101, false, 0x408); b += ce1s;
-	wl_ce_ring_prog("CE2-DST", 0x1b85000u, b, 128, 4, 83, true, 0); b += ce2;
-	wl_ce_ring_prog("CE2-STA", 0x1b85058u, b, 128, 1, 102, false, 0x408); b += ce2s;
-	wl_ce_ring_prog("CE3-SRC", 0x1b86000u, b, 32, 4, 67, false, 0x400);
-	printf("FUXI WLAN: W18 CE rings done faults %u\n", fw_faults);
-}
-
 static int
 wl_w15_run(void)
 {
