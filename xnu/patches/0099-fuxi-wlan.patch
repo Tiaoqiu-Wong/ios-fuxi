@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5269 @@
+@@ -0,0 +1,5337 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -4512,6 +4512,74 @@
 +	}
 +	if (wl_contain_wr(WL_BAR0 + 0x310c, saved) || wl_mrd(0x310c) != saved) { e = 1; }
 +	return e || fw_faults;
++}
++
++/* W19: post RX buffers on CE1 (HTC control) and CE2 (WMI), publish the tail
++ * pointer, then dump any destination-status completions for two seconds. */
++#define WL19_BUF 2048u
++#define WL19_N 16u
++
++static void
++wl19_post(unsigned ring_idx, unsigned n)
++{
++	struct wl_ce_ring *r = &wl18_ring[ring_idx];
++	for (unsigned i = 0; i < n; i++) {
++		uint64_t b = wl19_rx.iova + (uint64_t)i * WL19_BUF;
++		volatile uint32_t *d = (volatile uint32_t *)(r->va + (uint64_t)i * 16u);
++		d[0] = (uint32_t)b;
++		d[1] = (uint32_t)((b >> 32) & 0xffu);
++		d[2] = 0;
++		d[3] = 0;
++	}
++	wl_dma_clean(&wl19_rx);
++	wl_dma_clean(&wl18_rings);
++	uint32_t ctrl = ~0u, tp = ~0u, id0 = ~0u, dhp = ~0u, shp = ~0u, sbase = ~0u;
++	wl_ce_rd(r->reg + 0x08u, &id0);
++	wl_ce_rd(r->reg + 0xb0u, &ctrl);
++	wl_ce_rd(r->reg + 0x404u, &tp);
++	/* ath12k destination max length: read-modify-write bits[15:0]. */
++	wl_ce_wr(r->reg + 0xb0u, (ctrl & ~0xffffu) | 2048u);
++	wl_ce_wr(r->reg + 0x404u, n * r->dwords);
++	wl_ce_rd(r->reg + 0x400u, &dhp);
++	wl_ce_rd(r->reg + 0x408u, &shp);
++	wl_ce_rd(r->reg + 0x58u, &sbase);
++	printf("FUXI WLAN: W19 ring %u id %#x ctrl %#x tp %#x dstHP %#x staHP %#x staBase %#x faults %u\n",
++	    ring_idx, id0, ctrl, tp, dhp, shp, sbase, fw_faults);
++	for (unsigned ms = 0; ms < 200; ms += 20) {
++		uint32_t h = ~0u;
++		wl_sleep(20);
++		wl_ce_rd(r->reg + 0x400u, &h);
++		if (h != dhp) {
++			printf("FUXI WLAN: W19 ring %u dstHP moved %#x -> %#x after %u ms\n",
++			    ring_idx, dhp, h, ms + 20);
++			break;
++		}
++	}
++}
++
++static void
++wl_w19_ce_rx(void)
++{
++	if (!wl18_ce) { printf("FUXI WLAN: W19 requires fuxiwlanw18=1\n"); return; }
++	if (wl19_rx.va || wl_dma_alloc(&wl19_rx, WL19_N * WL19_BUF)) {
++		printf("FUXI WLAN: W19 RX allocation failed\n");
++		return;
++	}
++	printf("FUXI WLAN: W19 RX buffers IOVA %#llx bytes %u\n", wl19_rx.iova, WL19_N * WL19_BUF);
++	wl19_post(1, WL19_N / 2); /* CE1 HTC control/HTT */
++	wl19_post(3, WL19_N / 2); /* CE2 WMI */
++	for (unsigned ms = 0; ms < 2000; ms += 10) {
++		for (unsigned s = 0; s < 2; s++) {
++			unsigned idx = s ? 4 : 2;
++			volatile uint32_t *st = (volatile uint32_t *)wl18_ring[idx].va;
++			if (st[0] || st[1] || st[2] || st[3]) {
++				printf("FUXI WLAN: W19 status ring %u entry0 %#x %#x %#x %#x\n",
++				    idx, st[0], st[1], st[2], st[3]);
++			}
++		}
++		wl_sleep(10);
++	}
++	printf("FUXI WLAN: W19 CE RX post done faults %u\n", fw_faults);
 +}
 +
 +static int
