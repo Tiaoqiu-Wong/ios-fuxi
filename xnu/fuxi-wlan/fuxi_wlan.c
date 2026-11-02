@@ -4483,93 +4483,56 @@ wl_ce_wr(uint32_t off, uint32_t val)
 }
 
 static int
-wl_ce_ring_prog(const char *name, uint32_t reg, uint64_t iova, unsigned entries,
-    unsigned dwords, unsigned ring_id, bool dst, uint32_t hp_off)
+wl_ce_ring_core(const char *name, uint32_t reg, uint64_t iova, unsigned entries,
+    unsigned dwords, unsigned ring_id, bool src)
 {
 	unsigned bytes = entries * dwords * 4u;
 	uint32_t msb = (uint32_t)((iova >> 32) & 0xffffu) | (bytes << 16);
-	uint32_t bl = ~0u, bm = ~0u, id = ~0u, hp = ~0u;
-	int e = wl_ce_wr(reg + 0x00, (uint32_t)iova) |
-	    wl_ce_wr(reg + 0x04, msb) |
-	    wl_ce_wr(reg + 0x08, (ring_id << 8) | (dwords & 0xffu));
-	if (!e && dst) { e |= wl_ce_wr(reg + 0xb0, 2048u); }
-	if (!e && hp_off) { e |= wl_ce_wr(reg + hp_off, 0u); }
-	if (!e) {
-		e |= wl_ce_rd(reg + 0x00, &bl) | wl_ce_rd(reg + 0x04, &bm) |
-		     wl_ce_rd(reg + 0x08, &id);
-		if (hp_off) { e |= wl_ce_rd(reg + hp_off, &hp); }
-	}
-	printf("FUXI WLAN: W18 %s iova %#llx bytes %u BASE %#x:%#x ID %#x ctrl/hp %#x faults %u%s\n",
-	    name, iova, bytes, bm, bl, id, hp, fw_faults, e ? " FAILED" : "");
+	uint32_t misc = ~0u;
+	int e = wl_ce_wr(reg + 0x00u, (uint32_t)iova) |
+	    wl_ce_wr(reg + 0x04u, msb) |
+	    wl_ce_wr(reg + 0x08u, (ring_id << 8) | (dwords & 0xffu)) |
+	    /* MISC: SRNG_ENABLE (bit 6); source rings also disable MSI loop count. */
+	    wl_ce_wr(reg + 0x10u, 0x40u | (src ? 0x2u : 0u)) |
+	    wl_ce_wr(reg + 0x400u, 0u) |  /* HP */
+	    wl_ce_wr(reg + 0x404u, 0u);   /* TP */
+	e |= wl_ce_rd(reg + 0x10u, &misc);
+	printf("FUXI WLAN: W18b %s iova %#llx bytes %u id %#x misc %#x faults %u%s\n",
+	    name, iova, bytes, (ring_id << 8) | dwords, misc, fw_faults, e ? " FAILED" : "");
 	return e;
 }
 
-/* W19: post RX buffers on CE1 (HTC control) and CE2 (WMI), publish the tail
- * pointer, then dump any destination-status completions for two seconds. */
-#define WL19_BUF 2048u
-#define WL19_N 16u
-
 static void
-wl19_post(unsigned ring_idx, unsigned n)
+wl_w18_ce_rings(void)
 {
-	struct wl_ce_ring *r = &wl18_ring[ring_idx];
-	for (unsigned i = 0; i < n; i++) {
-		uint64_t b = wl19_rx.iova + (uint64_t)i * WL19_BUF;
-		volatile uint32_t *d = (volatile uint32_t *)(r->va + (uint64_t)i * 16u);
-		d[0] = (uint32_t)b;
-		d[1] = (uint32_t)((b >> 32) & 0xffu);
-		d[2] = 0;
-		d[3] = 0;
-	}
-	wl_dma_clean(&wl19_rx);
-	wl_dma_clean(&wl18_rings);
-	uint32_t ctrl = ~0u, tp = ~0u, id0 = ~0u, dhp = ~0u, shp = ~0u, sbase = ~0u;
-	wl_ce_rd(r->reg + 0x08u, &id0);
-	wl_ce_rd(r->reg + 0xb0u, &ctrl);
-	wl_ce_rd(r->reg + 0x404u, &tp);
-	/* ath12k destination max length: read-modify-write bits[15:0]. */
-	wl_ce_wr(r->reg + 0xb0u, (ctrl & ~0xffffu) | 2048u);
-	wl_ce_wr(r->reg + 0x404u, n * r->dwords);
-	wl_ce_rd(r->reg + 0x400u, &dhp);
-	wl_ce_rd(r->reg + 0x408u, &shp);
-	wl_ce_rd(r->reg + 0x58u, &sbase);
-	printf("FUXI WLAN: W19 ring %u id %#x ctrl %#x tp %#x dstHP %#x staHP %#x staBase %#x faults %u\n",
-	    ring_idx, id0, ctrl, tp, dhp, shp, sbase, fw_faults);
-	for (unsigned ms = 0; ms < 200; ms += 20) {
-		uint32_t h = ~0u;
-		wl_sleep(20);
-		wl_ce_rd(r->reg + 0x400u, &h);
-		if (h != dhp) {
-			printf("FUXI WLAN: W19 ring %u dstHP moved %#x -> %#x after %u ms\n",
-			    ring_idx, dhp, h, ms + 20);
-			break;
-		}
-	}
-}
+	unsigned ce0 = 16u * 16u, ce1 = 512u * 16u, ce1s = 512u * 4u,
+	    ce2 = 128u * 16u, ce2s = 128u * 4u, ce3 = 32u * 16u;
+	unsigned total = ce0 + ce1 + ce1s + ce2 + ce2s + ce3;
+	uint64_t b;
 
-static void
-wl_w19_ce_rx(void)
-{
-	if (!wl18_ce) { printf("FUXI WLAN: W19 requires fuxiwlanw18=1\n"); return; }
-	if (wl19_rx.va || wl_dma_alloc(&wl19_rx, WL19_N * WL19_BUF)) {
-		printf("FUXI WLAN: W19 RX allocation failed\n");
+	if (wl18_rings.va || wl_dma_alloc(&wl18_rings, total)) {
+		printf("FUXI WLAN: W18 CE ring allocation failed\n");
 		return;
 	}
-	printf("FUXI WLAN: W19 RX buffers IOVA %#llx bytes %u\n", wl19_rx.iova, WL19_N * WL19_BUF);
-	wl19_post(1, WL19_N / 2); /* CE1 HTC control/HTT */
-	wl19_post(3, WL19_N / 2); /* CE2 WMI */
-	for (unsigned ms = 0; ms < 2000; ms += 10) {
-		for (unsigned s = 0; s < 2; s++) {
-			unsigned idx = s ? 4 : 2;
-			volatile uint32_t *st = (volatile uint32_t *)wl18_ring[idx].va;
-			if (st[0] || st[1] || st[2] || st[3]) {
-				printf("FUXI WLAN: W19 status ring %u entry0 %#x %#x %#x %#x\n",
-				    idx, st[0], st[1], st[2], st[3]);
-			}
-		}
-		wl_sleep(10);
-	}
-	printf("FUXI WLAN: W19 CE RX post done faults %u\n", fw_faults);
+	b = wl18_rings.iova;
+	printf("FUXI WLAN: W18 CE rings IOVA %#llx total %u\n", b, total);
+	wl18_ring[0] = (struct wl_ce_ring){ b, (uint8_t *)wl18_rings.va, 16, 4, 0x1b80000u };
+	wl18_ring[1] = (struct wl_ce_ring){ b + ce0, (uint8_t *)wl18_rings.va + ce0, 512, 4, 0x1b81000u };
+	wl18_ring[2] = (struct wl_ce_ring){ b + ce0 + ce1, (uint8_t *)wl18_rings.va + ce0 + ce1, 512, 1, 0x1b81058u };
+	wl18_ring[3] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s, 128, 4, 0x1b85000u };
+	wl18_ring[4] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2, 128, 1, 0x1b85058u };
+	wl18_ring[5] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2 + ce2s, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2 + ce2s, 32, 4, 0x1b86000u };
+
+	wl_ce_ring_core("CE0-SRC", 0x1b80000u, wl18_ring[0].iova, 16, 4, 64, true);
+	wl_ce_ring_core("CE1-DST", 0x1b81000u, wl18_ring[1].iova, 512, 4, 82, false);
+	wl_ce_ring_core("CE1-STA", 0x1b81058u, wl18_ring[2].iova, 512, 1, 101, false);
+	wl_ce_ring_core("CE2-DST", 0x1b85000u, wl18_ring[3].iova, 128, 4, 83, false);
+	wl_ce_ring_core("CE2-STA", 0x1b85058u, wl18_ring[4].iova, 128, 1, 102, false);
+	wl_ce_ring_core("CE3-SRC", 0x1b86000u, wl18_ring[5].iova, 32, 4, 67, true);
+	/* Destination max length, and the status-ring enable for both pipes. */
+	wl_ce_wr(0x1b810b0u, 2048u);
+	wl_ce_wr(0x1b850b0u, 2048u);
+	printf("FUXI WLAN: W18 CE rings done faults %u\n", fw_faults);
 }
 
 static void
