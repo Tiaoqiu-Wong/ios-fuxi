@@ -4523,9 +4523,20 @@ wl19_post(unsigned ring_idx, unsigned n)
 	}
 	wl_dma_clean(&wl19_rx);
 	wl_dma_clean(&wl18_rings);
-	if (wl_ce_wr(r->reg + 0x404u, n * (r->dwords))) {
-		printf("FUXI WLAN: W19 TP publish failed ring %u\n", ring_idx);
-	}
+	uint32_t ctrl0 = ~0u, ctrl1 = ~0u, tp0 = ~0u, tp1 = ~0u, id0 = ~0u, msb0 = ~0u, sta = ~0u;
+	wl_ce_rd(r->reg + 0x00u, &ctrl0);
+	wl_ce_rd(r->reg + 0x04u, &msb0);
+	wl_ce_rd(r->reg + 0x08u, &id0);
+	wl_ce_rd(r->reg + 0x0bu, &sta);
+	wl_ce_rd(r->reg + 0xb0u, &ctrl0);
+	wl_ce_rd(r->reg + 0x404u, &tp0);
+	/* ath12k destination max length: read-modify-write bits[15:0]. */
+	wl_ce_wr(r->reg + 0xb0u, (ctrl0 & ~0xffffu) | 2048u);
+	wl_ce_rd(r->reg + 0xb0u, &ctrl1);
+	wl_ce_wr(r->reg + 0x404u, n * r->dwords);
+	wl_ce_rd(r->reg + 0x404u, &tp1);
+	printf("FUXI WLAN: W19 ring %u base %#x:%#x id %#x ctrl %#x->%#x tp %#x->%#x faults %u\n",
+	    ring_idx, msb0, ctrl0 & 0xffffffffu, id0, ctrl0, ctrl1, tp0, tp1, fw_faults);
 }
 
 static void
