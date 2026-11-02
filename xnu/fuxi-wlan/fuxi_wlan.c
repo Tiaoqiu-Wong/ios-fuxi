@@ -5401,12 +5401,10 @@ out:
 	thread_block(THREAD_CONTINUE_NULL);
 }
 
-/* fuxiprobeconf=1: stat the FuxiMetal storage paths before userspace runs. */
+/* fuxiprobeconf=1: stat the FuxiMetal storage paths after the root is mounted. */
 static void
-wl_probe_conf(void)
+wl_probe_conf_worker(void)
 {
-	int arg = 0;
-	if (!PE_parse_boot_argn("fuxiprobeconf", &arg, sizeof(arg)) || arg != 1) { return; }
 	const char *paths[] = { "/private/var/db/fuxi-metal",
 	    "/private/var/db/fuxi-metal/backboardd-501" };
 	vfs_context_t ctx = vfs_context_kernel();
@@ -5425,6 +5423,26 @@ wl_probe_conf(void)
 		else printf("FUXI WLAN CONF: %s uid %u gid %u mode %#o type %u\n", paths[i],
 		    (unsigned)a.va_uid, (unsigned)a.va_gid, (unsigned)a.va_mode, (unsigned)a.va_type);
 		(void)vnode_close(vp, FREAD, ctx);
+	}
+}
+
+static void
+wl_probe_conf_thread(void *arg, wait_result_t wr)
+{
+	(void)arg;
+	(void)wr;
+	delay_for_interval(5 * 1000 * 1000, NSEC_PER_USEC);
+	wl_probe_conf_worker();
+}
+
+static void
+wl_probe_conf(void)
+{
+	int arg = 0;
+	if (!PE_parse_boot_argn("fuxiprobeconf", &arg, sizeof(arg)) || arg != 1) { return; }
+	thread_t t = THREAD_NULL;
+	if (kernel_thread_start(wl_probe_conf_thread, NULL, &t) == KERN_SUCCESS) {
+		thread_deallocate(t);
 	}
 }
 
