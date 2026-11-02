@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5174 @@
+@@ -0,0 +1,5251 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -757,6 +757,8 @@
 +static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
 +static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
 +static unsigned wl17_ce; /* fuxiwlanw17=1: CE register inventory only */
++static unsigned wl18_ce; /* fuxiwlanw18=1: program CE0..CE3 rings */
++static struct wl_dma wl18_rings;
 +static unsigned wl_rails_variant;
 +static bool wl_rails_requested;
 +static bool wl16_large, wl16_redrive;
@@ -933,6 +935,11 @@
 +		if (variant < 0 || variant > 1) { wl_variant_invalid = true; }
 +		else { wl17_ce = (unsigned)variant; }
 +		if (wl17_ce) { printf("FUXI WLAN: W17 CE register inventory selected\n"); }
++		variant = 0;
++		(void)PE_parse_boot_argn("fuxiwlanw18", &variant, sizeof(variant));
++		if (variant < 0 || variant > 1) { wl_variant_invalid = true; }
++		else { wl18_ce = (unsigned)variant; }
++		if (wl18_ce) { printf("FUXI WLAN: W18 CE ring programming selected\n"); }
 +		if (variant) {
 +			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
 +			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
@@ -4474,6 +4481,75 @@
 +	printf("FUXI WLAN: W17 CE inventory done faults %u\n", fw_faults);
 +}
 +
++/* W18: program the four HTC-relevant CE rings after WLAN_MODE (ath12k
++ * ath12k_ce_init_pipes order: MODE first, then CE rings). All writes go through
++ * the CE window and are read back; any fault latches and the usual containment
++ * runs. The firmware already owns these rings while running, so the host takes
++ * them over exactly as Linux does after MODE. */
++static int
++wl_ce_wr(uint32_t off, uint32_t val)
++{
++	uint32_t saved, win;
++	int e;
++
++	if (fw_faults || (off & 3)) { return 1; }
++	saved = wl_mrd(0x310c);
++	win = 0x40000000u | WL_CE_STATIC_WIN | ((off >> 19) & 0x3fu);
++	wl_mwr(0x310c, win);
++	e = wl_mrd(0x310c) != win || fw_faults;
++	if (!e) {
++		wl_pwr(WL_BAR0 + WL_CE_WIN_BASE + (off & 0x7ffffu), val);
++		e = fw_faults;
++	}
++	if (wl_contain_wr(WL_BAR0 + 0x310c, saved) || wl_mrd(0x310c) != saved) { e = 1; }
++	return e || fw_faults;
++}
++
++static int
++wl_ce_ring_prog(const char *name, uint32_t reg, uint64_t iova, unsigned entries,
++    unsigned dwords, unsigned ring_id, bool dst, uint32_t hp_off)
++{
++	unsigned bytes = entries * dwords * 4u;
++	uint32_t msb = (uint32_t)((iova >> 32) & 0xffffu) | (bytes << 16);
++	uint32_t bl = ~0u, bm = ~0u, id = ~0u, hp = ~0u;
++	int e = wl_ce_wr(reg + 0x00, (uint32_t)iova) |
++	    wl_ce_wr(reg + 0x04, msb) |
++	    wl_ce_wr(reg + 0x08, (ring_id << 8) | (dwords & 0xffu));
++	if (!e && dst) { e |= wl_ce_wr(reg + 0xb0, 2048u); }
++	if (!e && hp_off) { e |= wl_ce_wr(reg + hp_off, 0u); }
++	if (!e) {
++		e |= wl_ce_rd(reg + 0x00, &bl) | wl_ce_rd(reg + 0x04, &bm) |
++		     wl_ce_rd(reg + 0x08, &id);
++		if (hp_off) { e |= wl_ce_rd(reg + hp_off, &hp); }
++	}
++	printf("FUXI WLAN: W18 %s iova %#llx bytes %u BASE %#x:%#x ID %#x ctrl/hp %#x faults %u%s\n",
++	    name, iova, bytes, bm, bl, id, hp, fw_faults, e ? " FAILED" : "");
++	return e;
++}
++
++static void
++wl_w18_ce_rings(void)
++{
++	unsigned ce0 = 16u * 16u, ce1 = 512u * 16u, ce1s = 512u * 4u,
++	    ce2 = 128u * 16u, ce2s = 128u * 4u, ce3 = 32u * 16u;
++	unsigned total = ce0 + ce1 + ce1s + ce2 + ce2s + ce3;
++	uint64_t b;
++
++	if (wl18_rings.va || wl_dma_alloc(&wl18_rings, total)) {
++		printf("FUXI WLAN: W18 CE ring allocation failed\n");
++		return;
++	}
++	b = wl18_rings.iova;
++	printf("FUXI WLAN: W18 CE rings IOVA %#llx total %u\n", b, total);
++	wl_ce_ring_prog("CE0-SRC", 0x1b80000u, b, 16, 4, 64, false, 0x400); b += ce0;
++	wl_ce_ring_prog("CE1-DST", 0x1b81000u, b, 512, 4, 82, true, 0); b += ce1;
++	wl_ce_ring_prog("CE1-STA", 0x1b81058u, b, 512, 1, 101, false, 0x408); b += ce1s;
++	wl_ce_ring_prog("CE2-DST", 0x1b85000u, b, 128, 4, 83, true, 0); b += ce2;
++	wl_ce_ring_prog("CE2-STA", 0x1b85058u, b, 128, 1, 102, false, 0x408); b += ce2s;
++	wl_ce_ring_prog("CE3-SRC", 0x1b86000u, b, 32, 4, 67, false, 0x400);
++	printf("FUXI WLAN: W18 CE rings done faults %u\n", fw_faults);
++}
++
 +static int
 +wl_w15_run(void)
 +{
@@ -4505,6 +4581,7 @@
 +	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
 +	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
 +	if (wl17_ce) { wl_w17_inventory(); }
++	if (wl18_ce) { wl_w18_ce_rings(); }
 +	wl16_snapshot("MODE reply");
 +	wl12_stage = WL15_OBSERVE;
 +	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
