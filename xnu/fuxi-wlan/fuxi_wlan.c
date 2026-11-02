@@ -105,6 +105,7 @@ static struct fw_window fw_windows[] = {
 	{0x01fd4000, 0x4000, 0},    /* TCSR clkref 0x1fd5100 */
 	{0x15000000, 0x100000, 0},  /* apps SMMU: GR0/GR1 + runtime-bounded CBs */
 	{0x60480000, 0x80000, 0},   /* EP sliding 512-KiB window: version + bounded BL logs */
+	{0x60500000, 0x80000, 0},   /* EP window 2: CE registers (2*WINDOW_START) */
 	{0x0f14c000, 0x18000, 0},   /* TLMM tiles gpio76..96 */
 	{0x17a20000, 0x4000, 0},    /* apps RSC DRV2 + TCS */
 	{0x60000000, 0x4000, 0},    /* PCIe0 DBI, ELBI 0xf20, iATU 0x1000 */
