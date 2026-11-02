@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5125 @@
+@@ -0,0 +1,5173 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -755,6 +755,7 @@
 +static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
 +static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
 +static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
++static unsigned wl17_ce; /* fuxiwlanw17=1: CE register inventory only */
 +static unsigned wl_rails_variant;
 +static bool wl_rails_requested;
 +static bool wl16_large, wl16_redrive;
@@ -926,6 +927,11 @@
 +		else { wl16_variant = (unsigned)variant; }
 +		wl16_large = wl16_variant == 1 || wl16_variant == 3;
 +		wl16_redrive = wl16_variant == 2 || wl16_variant == 3;
++		variant = 0;
++		(void)PE_parse_boot_argn("fuxiwlanw17", &variant, sizeof(variant));
++		if (variant < 0 || variant > 1) { wl_variant_invalid = true; }
++		else { wl17_ce = (unsigned)variant; }
++		if (wl17_ce) { printf("FUXI WLAN: W17 CE register inventory selected\n"); }
 +		if (variant) {
 +			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
 +			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
@@ -4426,6 +4432,47 @@
 +/* Firmware-start QMI only: no CE allocation, register programming, HTC or WMI.
 + * Adapted from Linux ath12k qmi.c (BSD-3-Clause-Clear), v6.12,
 + * ath12k_qmi_firmware_start: INI -> CFG -> MODE, one reply at a time. */
++/* W17: CE register window. ath12k pci.c: static window keeps the UMAC page in
++ * bits[17:12] and the CE page in bits[11:6]; the dynamic page index goes in
++ * bits[24:19]. CE registers sit at BAR + 2*WINDOW_START + (offset & 0x7ffff). */
++#define WL_CE_STATIC_WIN 0x14dc0u /* (0xa00000>>19)<<12 | (0x1b80000>>19)<<6 */
++#define WL_CE_WIN_BASE 0x100000ull
++
++static int
++wl_ce_rd(uint32_t off, uint32_t *val)
++{
++	uint32_t saved, win;
++	int e;
++
++	*val = ~0u;
++	if (fw_faults || (off & 3)) { return 1; }
++	saved = wl_mrd(0x310c);
++	win = 0x40000000u | WL_CE_STATIC_WIN | ((off >> 19) & 0x3fu);
++	wl_mwr(0x310c, win);
++	e = wl_mrd(0x310c) != win || fw_faults;
++	if (!e) { *val = wl_prd(WL_BAR0 + WL_CE_WIN_BASE + (off & 0x7ffffu)); }
++	if (wl_contain_wr(WL_BAR0 + 0x310c, saved) || wl_mrd(0x310c) != saved) { e = 1; }
++	return e || fw_faults;
++}
++
++/* Read-only inventory: nine CE SRC/DST ring bases, destination HP and control. */
++static void
++wl_w17_inventory(void)
++{
++	printf("FUXI WLAN: W17 CE window inventory begin static %#x\n", WL_CE_STATIC_WIN);
++	for (unsigned ce = 0; ce < 9; ce++) {
++		uint32_t src = 0x1b80000u + ce * 0x2000u, dst = 0x1b81000u + ce * 0x2000u;
++		uint32_t sl = ~0u, sh = ~0u, dl = ~0u, dh = ~0u, dhp = ~0u, ctrl = ~0u;
++		int e = wl_ce_rd(src + 0x00, &sl) || wl_ce_rd(src + 0x04, &sh) ||
++		    wl_ce_rd(dst + 0x00, &dl) || wl_ce_rd(dst + 0x04, &dh) ||
++		    wl_ce_rd(dst + 0x400, &dhp) || wl_ce_rd(dst + 0xb0, &ctrl);
++		printf("FUXI WLAN: W17 CE%u SRC %#x:%#x DST %#x:%#x DSTHP %#x CTRL %#x faults %u%s\n",
++		    ce, sh, sl, dh, dl, dhp, ctrl, fw_faults, e ? " read-failed" : "");
++		if (e || fw_faults) { break; }
++	}
++	printf("FUXI WLAN: W17 CE inventory done faults %u\n", fw_faults);
++}
++
 +static int
 +wl_w15_run(void)
 +{
@@ -4456,6 +4503,7 @@
 +	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
 +	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
 +	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
++	if (wl17_ce) { wl_w17_inventory(); }
 +	wl16_snapshot("MODE reply");
 +	wl12_stage = WL15_OBSERVE;
 +	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
