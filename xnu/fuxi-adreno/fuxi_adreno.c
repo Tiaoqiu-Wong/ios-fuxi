@@ -464,32 +464,6 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
 }
 static int fg_abi_live_for_scanout(void);
 #include "fuxi_gpu_scanout.inc"
-/* fuxiprobeconf=1: stat the FuxiMetal storage paths before userspace runs. */
-static void fg_probe_conf(void)
-{
- int arg = 0;
- if (!PE_parse_boot_argn("fuxiprobeconf", &arg, sizeof(arg)) || arg != 1) return;
- const char *paths[] = { "/private/var/db/fuxi-metal",
-     "/private/var/db/fuxi-metal/backboardd-501" };
- vfs_context_t ctx = vfs_context_kernel();
- for (unsigned i = 0; i < 2; i++) {
-  vnode_t vp = NULL;
-  int e = vnode_open(paths[i], O_RDONLY | O_NOFOLLOW, 0, 0, &vp, ctx);
-  if (e) { printf("FUXI GPU CONF: %s open failed %d\n", paths[i], e); continue; }
-  struct vnode_attr a;
-  VATTR_INIT(&a);
-  VATTR_WANTED(&a, va_uid);
-  VATTR_WANTED(&a, va_gid);
-  VATTR_WANTED(&a, va_mode);
-  VATTR_WANTED(&a, va_type);
-  e = vnode_getattr(vp, &a, ctx);
-  if (e) printf("FUXI GPU CONF: %s getattr failed %d\n", paths[i], e);
-  else printf("FUXI GPU CONF: %s uid %u gid %u mode %#o type %u\n", paths[i],
-      (unsigned)a.va_uid, (unsigned)a.va_gid, (unsigned)a.va_mode, (unsigned)a.va_type);
-  (void)vnode_close(vp, 0, ctx);
- }
-}
-
 static int fg_abi_init(void);
 static thread_call_data_t fg_init_call;
 static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
@@ -557,7 +531,6 @@ void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch
 {
  unsigned enable = 0;
  (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
- if (enable == 1) fg_probe_conf();
  if (enable != 1 || fg_started) return;
  fg_started = 1; fg_limit = 17;
  uint64_t requested_level = 0;

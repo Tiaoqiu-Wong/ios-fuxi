@@ -10,7 +10,7 @@
  bsd/dev/sweet_spmi.c			standard
 --- a/bsd/dev/fuxi_adreno.c
 +++ b/bsd/dev/fuxi_adreno.c
-@@ -0,0 +1,711 @@
+@@ -0,0 +1,515 @@
 +/* M6 platform adapter. gpu.c/gpu-a740.h/gpu-zap.h are exact shared probe
 + * sources, copied into patch 0096 by tools/sync-fuxi-adreno-shared.py.
 + * Fixed memory is excluded from boot_args AND ADT RAM before VM bootstrap.
@@ -34,9 +34,6 @@
 +#include <kern/kern_types.h>
 +#include "fuxi_adreno.h"
 +#include "gpu-handoff.h"
-+#include <IOKit/IOLocks.h>
-+#include "fuxi_gpu_abi.h"
-+#include "fuxi_abi_wire.h"
 +extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 +/* The BSD header export omits sched_prim's private dependencies. These match
 + * osfmk/kern/{processor,sched_prim}.h; processor_t remains opaque here. */
@@ -53,7 +50,6 @@
 +#define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
 +#define delay fg_delay
 +static void fg_delay(unsigned us) { delay_for_interval(us, NSEC_PER_USEC); }
-+static unsigned fg_scanout_requested;
 +struct fg_window { uint64_t pa, size; uintptr_t va; };
 +/* Disjoint apertures; the framebuffer is mapped by SweetFramebuffer only.
 + * Stage14 uses scratch, never stage15's panel readback/CPU comparator. */
@@ -64,7 +60,6 @@
 + {0xb280000,0x8000,0}, {0x81c60000,0x20000,0},
 + {FG_SCRATCH,FG_SCRATCH_SIZE,0}, {0x9b098000,0x4000,0},
 + {0xae04000,0x4000,0},
-+ {0xae14000,0x4000,0}, {0xae34000,0x4000,0},
 +};
 +static uint64_t fg_mapped_bytes;
 +/* io_map's 8 MiB submap and ALL ml_io_map variants use KMA_NOFAIL.
@@ -100,7 +95,6 @@
 +{
 + for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
 +  struct fg_window *w = &fg_windows[i];
-+  if (!fg_scanout_requested && (w->pa == 0xae14000 || w->pa == 0xae34000)) continue;
 +  kern_return_t kr = fg_map_window(w);
 +  if (kr != KERN_SUCCESS) {
 +   printf("FUXI GPU: map PA %#llx bytes %#llx failed %d, mapped %llu bytes, IO submap 0 bytes\n",
@@ -114,31 +108,17 @@
 +static unsigned fg_access_failed;
 +uint32_t probe_fault_esr;
 +uint64_t probe_fault_far;
-+uintptr_t fuxi_gpu_nc_pointer(uint64_t pa, uint64_t bytes)
++static uintptr_t fg_pointer(uint64_t pa)
 +{
-+ if (!bytes) return 0;
 + for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
 +  struct fg_window *w = &fg_windows[i];
-+  if (pa < w->pa || !w->va) continue;
-+  uint64_t offset = pa-w->pa;
-+  if (offset >= w->size || bytes > w->size-offset || offset > UINTPTR_MAX-w->va) continue;
-+  uintptr_t va = w->va + offset;
-+  if (bytes-1 <= UINTPTR_MAX-va) return va;
++  if (pa >= w->pa && pa-w->pa < w->size && w->va) return w->va + pa-w->pa;
 + }
 + return 0;
 +}
-+/* No physmap fallback: reserved scratch, firmware and MMIO live in the
-+ * lifetime kernel_map NC windows. Reject an entire access crossing an edge. */
-+static uintptr_t fg_pointer(uint64_t pa) { return fuxi_gpu_nc_pointer(pa, 1); }
-+static uintptr_t fg_pointer_range(uint64_t pa, uint64_t bytes)
-+{
-+ uintptr_t va = fuxi_gpu_nc_pointer(pa, bytes);
-+ if (!va) panic("FUXI GPU: unmapped NC range PA %#llx bytes %#llx", pa, bytes);
-+ return va;
-+}
 +static unsigned fg_access(uint64_t pa, uint64_t *v, unsigned wr, unsigned wide)
 +{
-+ uintptr_t va = fuxi_gpu_nc_pointer(pa, wide ? 8 : 4);
++ uintptr_t va = fg_pointer(pa);
 + if (!va || (pa & (wide ? 7 : 3))) return fg_access_failed = 1;
 + unsigned bad = fuxi_gpu_access(va, v, wr, wide);
 + if (bad) {
@@ -168,107 +148,17 @@
 +}
 +static const uint8_t *fg_firmware(unsigned which, unsigned *size)
 +{
-+ const struct fg_handoff *h = (const struct fg_handoff *)fg_pointer_range(FG_HANDOFF, sizeof(struct fg_handoff));
++ const struct fg_handoff *h = (const struct fg_handoff *)fg_pointer(FG_HANDOFF);
 + *size = h->fw_size[which];
-+ return (const uint8_t *)fg_pointer_range(FG_FW_BASE + which*FG_FW_SLOT, FG_FW_SLOT);
++ return (const uint8_t *)fg_pointer(FG_FW_BASE + which*FG_FW_SLOT);
 +}
-+static unsigned fg_abi_enabled, fg_client_busy;
-+static IOLock *fg_ring_lock;
-+/* Present callers already hold the surface lock. ABI never takes that lock;
-+ * neither client waits nor BO allocations hold this short ring/table mutex. */
-+struct fg_guard { IOLock *lock; };
-+static void fg_guard_exit(struct fg_guard *g) { if (g->lock) IOLockUnlock(g->lock); }
-+#define FG_GUARD struct fg_guard guard __attribute__((cleanup(fg_guard_exit))) = {fg_ring_lock}; if (guard.lock) IOLockLock(guard.lock)
 +#define FUXI_GPU_XNU 1
 +#define G_PTR(pa) fg_pointer(pa)
-+#define G_PTR_RANGE(pa, bytes) fg_pointer_range(pa, bytes)
 +#define G_RING_INDEX(w) ((w) & 8191u)
 +static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
 +    uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c);
 +#include "gpu.c"
-+static unsigned fg_clock_measure;
-+/* Startup diagnostics have their own fault result: an optional readback must
-+ * not latch fg_access_failed and poison an otherwise working GPU. Only call
-+ * while the proven cold-start power/clock sequence and GPU_SET are retained. */
-+static int fg_clock_io(uint64_t pa, uint32_t *word, unsigned write)
-+{
-+ uintptr_t va = fuxi_gpu_nc_pointer(pa, 4);
-+ uint64_t value = *word;
-+ if (!va || fuxi_gpu_access(va, &value, write, 0)) return 0;
-+ __asm__ volatile("dsb sy" ::: "memory");
-+ if (!write) *word = (uint32_t)value;
-+ return 1;
-+}
-+static int fg_clock_counter(uint64_t *value)
-+{
-+ /* A7xx RBBM counter3 at 0x322/323, high/low/high. Public freedreno
-+  * a6xx.xml register documentation; ALWAYS_COUNT selector is zero. */
-+ for (unsigned i = 0; i < 8; i++) {
-+  uint32_t h = 0, l = 0, again = 0;
-+  if (!fg_clock_io(GPU_REG_BASE+0x323*4, &h, 0) ||
-+      !fg_clock_io(GPU_REG_BASE+0x322*4, &l, 0) ||
-+      !fg_clock_io(GPU_REG_BASE+0x323*4, &again, 0)) return 0;
-+  if (h == again) { *value = (uint64_t)h<<32 | l; return 1; }
-+ }
-+ return 0;
-+}
-+static void fg_clock_sample(void)
-+{
-+ uint32_t control = 0, selector = 0;
-+ uint64_t first = 0, last = 0, start = 0, end = 0;
-+ if (!fg_clock_io(GPU_REG_BASE+0x500*4, &control, 0) ||
-+     !fg_clock_io(GPU_REG_BASE+0x50a*4, &selector, 0)) goto unavailable;
-+ uint32_t enable = control | 1, always = 0;
-+ int ok = fg_clock_io(GPU_REG_BASE+0x50a*4, &always, 1) &&
-+     fg_clock_io(GPU_REG_BASE+0x500*4, &enable, 1) && fg_clock_counter(&first);
-+ if (ok) {
-+  start = rsr("cntpct_el0");
-+  delay(1000); /* one startup sample only, before ABI/display publication */
-+  ok = fg_clock_counter(&last);
-+  end = rsr("cntpct_el0");
-+ }
-+ /* Counter selection/global enable belong to the pre-publication state.
-+  * Restore both even after a failed access; never retry the sample. */
-+ int restored = fg_clock_io(GPU_REG_BASE+0x50a*4, &selector, 1);
-+ restored &= fg_clock_io(GPU_REG_BASE+0x500*4, &control, 1);
-+ uint64_t timer = rsr("cntfrq_el0");
-+ if (ok && restored && end > start && timer && last > first &&
-+     last-first <= 2000000 && end-start <= timer/10) {
-+  printf("FUXI GPU CLOCK: rbbm_count_khz=%llu sample_us=%llu (clock-gated sample)\n",
-+      (last-first)*timer/(end-start)/1000, (end-start)*1000000/timer);
-+  return;
-+ }
-+ unavailable:
-+ printf("FUXI GPU CLOCK: rbbm_count_khz=unavailable\n");
-+}
-+static void fg_clock_log(void)
-+{
-+ unsigned index = g_gpu_selected ? g_gpu_selected : 1, bw = g_gpu_bw_index(g_gpu_selected);
-+ printf("FUXI GPU CLOCK: level=%u gpu_index=%u requested_khz=%u gx_arc=%#x bw_index=%u ddr_kBps=%u hfi_ack=1\n",
-+     g_gpu_selected,index,g_gpu_freq[index],gpu_extra[0][100+index],bw,g_gpu_ddr[bw]);
-+ printf("FUXI GPU CLOCK: GMU table_khz=0/200000/500000 cx_arc=%#x/%#x/%#x (no host GMU perf-index vote)\n",
-+     gpu_extra[0][110],gpu_extra[0][111],gpu_extra[0][112]);
-+ static const uint32_t offsets[] = {CC_PLL0+PLL_MODE,CC_PLL0+PLL_L_VAL,CC_PLL0+0x14,
-+     CC_PLL1+PLL_MODE,CC_PLL1+PLL_OPMODE,CC_PLL1+PLL_L_VAL,CC_PLL1+0x14,CC_GMU_RCGR+4};
-+ uint32_t v[8] = {0};
-+ for (unsigned i = 0; i < 8; i++)
-+  if (!fg_clock_io(GPU_GPUCC_BASE+offsets[i], &v[i], 0)) {
-+   printf("FUXI GPU CLOCK: gpucc_readback=unavailable core_measured_khz=unavailable\n"); return;
-+  }
-+ /* PLL1 main -> GMU source3, HID divider=(field+1)/2, 19.2 MHz XO.
-+  * This is register-derived, not a measured frequency or a GPU core rate. */
-+ uint64_t pll = ((uint64_t)(v[5]&0xffff)*65536+(v[6]&0xffff))*19200/65536;
-+ unsigned gmu = (v[3]&PLL_OUTCTRL) && v[4] == PLL_RUN && ((v[7]>>8)&7) == 3 ?
-+     (unsigned)(pll*2/((v[7]&31)+1)) : 0;
-+ printf("FUXI GPU CLOCK: PLL0 mode=%#x l=%#x alpha=%#x PLL1 mode=%#x l=%#x alpha=%#x gmu_rcgr=%#x gmu_derived_khz=%u core_measured_khz=unavailable\n",
-+     v[0],v[1],v[2],v[3],v[5],v[6],v[7],gmu);
-+ if (fg_clock_measure) {
-+  uint32_t cx = 0, gx = 0;
-+  if (fg_clock_io(GPU_GPUCC_BASE+CC_CX_GDSCR, &cx, 0) && g_gdsc_on(cx) &&
-+      fg_clock_io(GPU_GPUCC_BASE+CC_GX_GDSCR, &gx, 0) && g_gdsc_on(gx)) fg_clock_sample();
-+  else printf("FUXI GPU CLOCK: rbbm_count_khz=unavailable\n");
-+ }
-+}
++
 +/* Retain BOTH physical attempts, independently of the shared logical-call
 + * report slot. Static storage only; no allocation or firmware in diagnostics. */
 +static volatile struct {
@@ -323,14 +213,10 @@
 +static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
 +static volatile uint64_t *fg_l2(void)
 +{
-+ volatile uint64_t *root = (volatile uint64_t *)G_PTR_RANGE(G3_PT,4096);
-+ return (volatile uint64_t *)G_PTR_RANGE(root[1] & ~4095ULL,4096);
++ volatile uint64_t *root = (volatile uint64_t *)G_PTR(G3_PT);
++ return (volatile uint64_t *)G_PTR(root[1] & ~4095ULL);
 +}
 +static volatile unsigned fg_state; /* 0 disabled/starting, 1 ready, 2 permanently failed */
-+/* Serialized with the ring after startup. Counts survive client close/open;
-+ * failure before ready is not a lost userspace context. No recovery yet. */
-+static uint64_t fg_faults, fg_suspends;
-+static unsigned fg_reset_held;
 +static unsigned fg_started, fg_limit, fg_force, fg_seq;
 +int fuxi_gpu_ready(void) { return __atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) == 1; }
 +static uint64_t fg_deadline, fg_submit_time;
@@ -338,7 +224,6 @@
 +static int fg_expired(void) { return rsr("cntpct_el0") >= fg_deadline; }
 +static void fg_fail(const char *reason, unsigned code)
 +{
-+ if (fuxi_gpu_ready() && fg_faults!=UINT64_MAX) ++fg_faults;
 + __atomic_store_n(&fg_state, 2, __ATOMIC_RELEASE);
 + printf("FUXI GPU: disabled permanently: %s (%#x), CPU present\n", reason, code);
 +}
@@ -365,11 +250,7 @@
 +   if (fg_access(GPU_REG_BASE + 0x3c45*4, &v, 1, 0)) good = 0;
 +  }
 + }
-+ v = 1;
-+ if (!fg_access(GPU_REG_BASE + 0x43*4, &v, 1, 0) && !fg_reset_held) {
-+  fg_reset_held=1;
-+  if (fg_suspends!=UINT64_MAX) ++fg_suspends;
-+ }
++ v = 1; (void)fg_access(GPU_REG_BASE + 0x43*4, &v, 1, 0);
 + delay(100);
 + for (unsigned i = 0; i < 2; i++) {
 +  v = 2u << 16; (void)fg_access(GPU_SMMU_BASE + SMMU_S2CR(g3_slot[i]), &v, 1, 0);
@@ -397,7 +278,6 @@
 + * new generation. No PFN scan or TLB invalidation on a cache hit. */
 +int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
 +{
-+ FG_GUARD;
 + if (slot >= FG_CACHE_SLOTS || fg_busy) return 0;
 + uint64_t start = mach_absolute_time();
 + volatile uint64_t *l2 = fg_l2();
@@ -418,11 +298,10 @@
 +int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
 +    uint64_t length, struct fg_times *t)
 +{
-+ FG_GUARD;
 + if (!fuxi_gpu_ready() || slot >= FG_CACHE_SLOTS || !generation || fg_generation[slot] || !length ||
 +     length > FG_SOURCE_BYTES || length+(source&4095) > FG_SOURCE_BYTES) return 0;
 + uint64_t start = mach_absolute_time();
-+ volatile uint64_t *leaves = (volatile uint64_t *)G_PTR_RANGE(FG_SOURCE_TABLE+slot*32768,32768);
++ volatile uint64_t *leaves = (volatile uint64_t *)G_PTR(FG_SOURCE_TABLE+slot*32768);
 + volatile uint64_t *l2 = fg_l2();
 + unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
 + unsigned pages = (length+(source&4095)+4095)/4096;
@@ -475,41 +354,12 @@
 + t->misses++;
 + return 1;
 +}
-+static int fg_abi_live_for_scanout(void);
-+#include "fuxi_gpu_scanout.inc"
-+/* fuxiprobeconf=1: stat the FuxiMetal storage paths before userspace runs. */
-+static void fg_probe_conf(void)
-+{
-+ int arg = 0;
-+ if (!PE_parse_boot_argn("fuxiprobeconf", &arg, sizeof(arg)) || arg != 1) return;
-+ const char *paths[] = { "/private/var/db/fuxi-metal",
-+     "/private/var/db/fuxi-metal/backboardd-501" };
-+ vfs_context_t ctx = vfs_context_kernel();
-+ for (unsigned i = 0; i < 2; i++) {
-+  vnode_t vp = NULL;
-+  int e = vnode_open(paths[i], O_RDONLY | O_NOFOLLOW, 0, 0, &vp, ctx);
-+  if (e) { printf("FUXI GPU CONF: %s open failed %d\n", paths[i], e); continue; }
-+  struct vnode_attr a;
-+  VATTR_INIT(&a);
-+  VATTR_WANTED(&a, va_uid);
-+  VATTR_WANTED(&a, va_gid);
-+  VATTR_WANTED(&a, va_mode);
-+  VATTR_WANTED(&a, va_type);
-+  e = vnode_getattr(vp, &a, ctx);
-+  if (e) printf("FUXI GPU CONF: %s getattr failed %d\n", paths[i], e);
-+  else printf("FUXI GPU CONF: %s uid %u gid %u mode %#o type %u\n", paths[i],
-+      (unsigned)a.va_uid, (unsigned)a.va_gid, (unsigned)a.va_mode, (unsigned)a.va_type);
-+  (void)vnode_close(vp, 0, ctx);
-+ }
-+}
-+
-+static int fg_abi_init(void);
 +static thread_call_data_t fg_init_call;
 +static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
 +{
 + (void)arg; (void)result;
 + /* Sleepable thread-call worker, delayed until after AppleCLCD registers. */
-+ DTEntry chosen; const void *prop; unsigned bytes;
++ DTEntry chosen; void *prop; unsigned bytes;
 + if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 +     SecureDTGetProperty(chosen, "fuxi-gpu-memory", &prop, &bytes) != kSuccess ||
 +     bytes != 16 || ((uint64_t *)prop)[0] != FG_SCRATCH || ((uint64_t *)prop)[1] != FG_SCRATCH_SIZE) {
@@ -522,7 +372,7 @@
 + }
 + kern_return_t kr = fg_map_windows();
 + if (kr != KERN_SUCCESS) { fg_fail("uncached mapping failed", kr); goto out; }
-+ const struct fg_handoff *h = (const struct fg_handoff *)G_PTR_RANGE(FG_HANDOFF,sizeof(struct fg_handoff));
++ const struct fg_handoff *h = (const struct fg_handoff *)G_PTR(FG_HANDOFF);
 + if (h->magic != FG_MAGIC || h->version != 1 || h->bytes != sizeof(*h) || h->reserved ||
 +     h->base != FG_SCRATCH || h->size != FG_SCRATCH_SIZE) {
 +  fg_fail("missing/invalid cold firmware handoff", 3); goto out;
@@ -530,7 +380,7 @@
 + for (unsigned i = 0; i < 3; i++) {
 +  unsigned n = h->fw_size[i];
 +  if (!n || n > FG_FW_SLOT || (n & 3) ||
-+      fg_hash((const uint8_t *)G_PTR_RANGE(FG_FW_BASE+i*FG_FW_SLOT,n), n) != h->fw_hash[i]) {
++      fg_hash((const uint8_t *)G_PTR(FG_FW_BASE+i*FG_FW_SLOT), n) != h->fw_hash[i]) {
 +   fg_fail("firmware size/checksum", i); goto out;
 +  }
 + }
@@ -548,7 +398,6 @@
 +     "fence=%#x TRUST=%#x zap=%#x pixels=%#x\n", fg_limit == 13 ? 13 : 16,
 +     g_bank, g3_bank, g3_asid, g3_read(G3_FENCE_PA), g3_gr(0xf400),
 +     gpu_extra[13][2], gpu_extra[11][2]);
-+ fg_clock_log();
 + if (fg_limit < 17 || fg_force == 1) { fg_fail("diagnostic stop after self-test", fg_limit); goto out; }
 + if (g3_read(0xae05014) != G4_FB_PA || g3_read(0xae05024) != 4320 ||
 +     g3_read(0xae05000) != (2400u<<16 | 1080u) || g3_read(0xae05030) != 0x237ff ||
@@ -556,36 +405,16 @@
 +     !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
 + uint32_t tlb[128] = {0};
 + if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
-+ printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, requested %u kHz GPU vote (not measured), async one-in-flight, no timer sleep\n", g_gpu_freq[g_gpu_selected ? g_gpu_selected : 1]);
-+ /* Finish all ABI-only MMIO/table setup before the display can submit.
-+  * Publication may race userspace, so it follows the release of ready. */
-+ int publish_abi = fg_abi_enabled && fg_abi_init();
-+ if (fg_abi_enabled && !publish_abi)
-+  printf("FUXI GPU ABI: initialization failed, service withheld\n");
++ printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, async one-in-flight, no timer sleep\n");
 + __atomic_store_n(&fg_state, 1, __ATOMIC_RELEASE);
-+ if (publish_abi) fuxi_gpu_abi_publish();
 + out: return;
 +}
 +void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch)
 +{
 + unsigned enable = 0;
 + (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
-+ if (enable == 1) fg_probe_conf();
 + if (enable != 1 || fg_started) return;
 + fg_started = 1; fg_limit = 17;
-+ uint64_t requested_level = 0;
-+ (void)PE_parse_boot_argn("fuxigpulevel", &requested_level, sizeof(requested_level));
-+ g_gpu_selected = g_gpu_select(requested_level);
-+ if (requested_level > G_GPU_LEVEL_MAX)
-+  printf("FUXI GPU CLOCK: rejected fuxigpulevel=%llu (allowed 0..%u); legacy level=0\n", requested_level, G_GPU_LEVEL_MAX);
-+ (void)PE_parse_boot_argn("fuxigpuclock", &fg_clock_measure, sizeof(fg_clock_measure));
-+ fg_clock_measure = fg_clock_measure == 1;
-+ (void)PE_parse_boot_argn("fuxigpuabi", &fg_abi_enabled, sizeof(fg_abi_enabled));
-+ fg_abi_enabled = fg_abi_enabled == 1;
-+ if (fg_abi_enabled && !(fg_ring_lock = IOLockAlloc())) {
-+  fg_abi_enabled = 0;
-+  printf("FUXI GPU ABI: no ring mutex, service withheld\n");
-+ }
 + (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
 + (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
 + if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
@@ -639,20 +468,12 @@
 + * A completed fence wins over a late timer/deadline. */
 +int fuxi_gpu_poll(struct fg_times *t)
 +{
-+ FG_GUARD;
 + if (!fg_busy) return 1;
 + int err = fg_access_failed || g3_faulted();
 + if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && g3_gr(0x806) == g3_wptr &&
 +     g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) {
-+  t->wait += mach_absolute_time()-fg_submit_time;
-+  if (fg_scanout_requested && !fg_scanout_verify()) {
-+   fg_fail("scanout pixel mismatch", 0x604);
-+   int drained = fg_isolate();
-+   fg_busy = 0;
-+   if (!drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
-+   return drained ? -1 : -2;
-+  }
 +  fg_busy = 0;
++  t->wait += mach_absolute_time()-fg_submit_time;
 +  return 1;
 + }
 + if (!err && !fg_expired()) return 0;
@@ -660,7 +481,6 @@
 + /* Only fault containment has bounded register polling; no scheduler wait. */
 + int drained = fg_isolate();
 + fg_busy = 0;
-+ if (!drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
 + t->wait += mach_absolute_time()-fg_submit_time;
 + return drained ? -1 : -2;
 +}
@@ -668,9 +488,7 @@
 +    unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
 +    unsigned width, unsigned height, struct fg_times *t)
 +{
-+ FG_GUARD;
-+ if (fg_scanout_owned && !fg_scanout_writable) return 0;
-+ if (!fuxi_gpu_ready() || fg_busy || fg_client_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
++ if (!fuxi_gpu_ready() || fg_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
 + if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
 +     (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
 +     length+(source&4095) > FG_SOURCE_BYTES ||
@@ -680,13 +498,7 @@
 + t->clean += mach_absolute_time()-start;
 + start = mach_absolute_time();
 + int err = 0;
-+ if (g3_faulted()) {
-+  fg_fail("before present", 0x601);
-+  if (fg_scanout_owned && !fg_isolate()) {
-+   (void)fg_scanout_stop("GPU DMA drain failed"); return -1;
-+  }
-+  return 0;
-+ }
++ if (g3_faulted()) { fg_fail("before present", 0x601); return 0; }
 + unsigned stride = 2;
 + while ((pitch*stride) & 63) stride *= 2;
 + /* XML has 15-bit dimensions; coordinates here are <2416 and strided pitch
@@ -706,21 +518,13 @@
 + t->submit += mach_absolute_time()-start;
 + if (err || fg_access_failed) {
 +  fg_fail("present submit", err);
-+  int drained = fg_isolate();
-+  if (!drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
-+  return drained ? 0 : -1;
-+ }
-+ if (fg_scanout_requested) {
-+  fg_scanout_source = source; fg_scanout_pitch = pitch;
-+  fg_scanout_sx = sx; fg_scanout_sy = sy; fg_scanout_dx = dx; fg_scanout_dy = dy;
-+  fg_scanout_w = width; fg_scanout_h = height;
++  return !fg_isolate() ? -1 : 0;
 + }
 + fg_magic = magic;
 + fg_submit_time = mach_absolute_time();
 + fg_busy = 1;
 + return 2; /* submitted; source is owned until poll retires this fence */
 +}
-+#include "fuxi_gpu_abi_backend.inc"
 +#endif
 --- a/bsd/dev/fuxi_adreno.h
 +++ b/bsd/dev/fuxi_adreno.h
