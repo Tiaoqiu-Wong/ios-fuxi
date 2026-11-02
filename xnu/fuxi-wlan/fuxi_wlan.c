@@ -4523,20 +4523,28 @@ wl19_post(unsigned ring_idx, unsigned n)
 	}
 	wl_dma_clean(&wl19_rx);
 	wl_dma_clean(&wl18_rings);
-	uint32_t ctrl0 = ~0u, ctrl1 = ~0u, tp0 = ~0u, tp1 = ~0u, id0 = ~0u, msb0 = ~0u, sta = ~0u;
-	wl_ce_rd(r->reg + 0x00u, &ctrl0);
-	wl_ce_rd(r->reg + 0x04u, &msb0);
+	uint32_t ctrl = ~0u, tp = ~0u, id0 = ~0u, dhp = ~0u, shp = ~0u, sbase = ~0u;
 	wl_ce_rd(r->reg + 0x08u, &id0);
-	wl_ce_rd(r->reg + 0x0bu, &sta);
-	wl_ce_rd(r->reg + 0xb0u, &ctrl0);
-	wl_ce_rd(r->reg + 0x404u, &tp0);
+	wl_ce_rd(r->reg + 0xb0u, &ctrl);
+	wl_ce_rd(r->reg + 0x404u, &tp);
 	/* ath12k destination max length: read-modify-write bits[15:0]. */
-	wl_ce_wr(r->reg + 0xb0u, (ctrl0 & ~0xffffu) | 2048u);
-	wl_ce_rd(r->reg + 0xb0u, &ctrl1);
+	wl_ce_wr(r->reg + 0xb0u, (ctrl & ~0xffffu) | 2048u);
 	wl_ce_wr(r->reg + 0x404u, n * r->dwords);
-	wl_ce_rd(r->reg + 0x404u, &tp1);
-	printf("FUXI WLAN: W19 ring %u base %#x:%#x id %#x ctrl %#x->%#x tp %#x->%#x faults %u\n",
-	    ring_idx, msb0, ctrl0 & 0xffffffffu, id0, ctrl0, ctrl1, tp0, tp1, fw_faults);
+	wl_ce_rd(r->reg + 0x400u, &dhp);
+	wl_ce_rd(r->reg + 0x408u, &shp);
+	wl_ce_rd(r->reg + 0x58u, &sbase);
+	printf("FUXI WLAN: W19 ring %u id %#x ctrl %#x tp %#x dstHP %#x staHP %#x staBase %#x faults %u\n",
+	    ring_idx, id0, ctrl, tp, dhp, shp, sbase, fw_faults);
+	for (unsigned ms = 0; ms < 200; ms += 20) {
+		uint32_t h = ~0u;
+		wl_sleep(20);
+		wl_ce_rd(r->reg + 0x400u, &h);
+		if (h != dhp) {
+			printf("FUXI WLAN: W19 ring %u dstHP moved %#x -> %#x after %u ms\n",
+			    ring_idx, dhp, h, ms + 20);
+			break;
+		}
+	}
 }
 
 static void
