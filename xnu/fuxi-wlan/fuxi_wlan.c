@@ -729,6 +729,7 @@ static unsigned wl18_ce; /* fuxiwlanw18=1: program CE0..CE3 rings */
 static unsigned wl19_ce; /* fuxiwlanw19=1: post CE RX and log completions */
 static struct wl_dma wl19_rx;
 static struct wl_dma wl18_rings;
+static struct wl_dma wl18_rdp;
 struct wl_ce_ring { uint64_t iova; uint8_t *va; unsigned entries; unsigned dwords; uint32_t reg; };
 static struct wl_ce_ring wl18_ring[6];
 static unsigned wl_rails_variant;
@@ -4552,21 +4553,34 @@ wl_w19_ce_rx(void)
 
 static int
 wl_ce_ring_core(const char *name, uint32_t reg, uint64_t iova, unsigned entries,
-    unsigned dwords, unsigned ring_id, bool src)
+    unsigned dwords, unsigned ring_id, bool src, uint32_t hp_off, uint64_t rdp_iova)
 {
 	unsigned bytes = entries * dwords * 4u;
 	uint32_t msb = (uint32_t)((iova >> 32) & 0xffffu) | (bytes << 16);
+	uint64_t rdp = rdp_iova + ring_id;
 	uint32_t misc = ~0u;
 	int e = wl_ce_wr(reg + 0x00u, (uint32_t)iova) |
 	    wl_ce_wr(reg + 0x04u, msb) |
-	    wl_ce_wr(reg + 0x08u, (ring_id << 8) | (dwords & 0xffu)) |
-	    /* MISC: SRNG_ENABLE (bit 6); source rings also disable MSI loop count. */
-	    wl_ce_wr(reg + 0x10u, 0x40u | (src ? 0x2u : 0u)) |
-	    wl_ce_wr(reg + 0x400u, 0u) |  /* HP */
-	    wl_ce_wr(reg + 0x404u, 0u);   /* TP */
+	    wl_ce_wr(reg + 0x08u, (ring_id << 8) | (dwords & 0xffu));
+	if (src) {
+		/* source ring: target publishes its TP through the RDP; interrupts off */
+		e |= wl_ce_wr(reg + 0x1cu, (uint32_t)rdp) |
+		    wl_ce_wr(reg + 0x20u, (uint32_t)(rdp >> 32)) |
+		    wl_ce_wr(reg + 0x30u, 0u) |
+		    wl_ce_wr(reg + 0x34u, 0u) |
+		    wl_ce_wr(reg + 0x10u, 0x40u | 0x2u);
+	} else {
+		/* destination ring: target publishes its HP through the RDP */
+		e |= wl_ce_wr(reg + 0x14u, (uint32_t)rdp) |
+		    wl_ce_wr(reg + 0x18u, (uint32_t)(rdp >> 32)) |
+		    wl_ce_wr(reg + 0x24u, 0u) |
+		    wl_ce_wr(reg + 0x10u, 0x40u);
+	}
+	e |= wl_ce_wr(reg + hp_off, 0u) |
+	    wl_ce_wr(reg + hp_off + 4u, 0u);
 	e |= wl_ce_rd(reg + 0x10u, &misc);
-	printf("FUXI WLAN: W18b %s iova %#llx bytes %u id %#x misc %#x faults %u%s\n",
-	    name, iova, bytes, (ring_id << 8) | dwords, misc, fw_faults, e ? " FAILED" : "");
+	printf("FUXI WLAN: W18c %s iova %#llx bytes %u id %#x misc %#x rdp %#llx faults %u%s\n",
+	    name, iova, bytes, (ring_id << 8) | dwords, misc, rdp, fw_faults, e ? " FAILED" : "");
 	return e;
 }
 
@@ -4582,6 +4596,10 @@ wl_w18_ce_rings(void)
 		printf("FUXI WLAN: W18 CE ring allocation failed\n");
 		return;
 	}
+	if (!wl18_rdp.va && wl_dma_alloc(&wl18_rdp, 4096)) {
+		printf("FUXI WLAN: W18 CE RDP page allocation failed\n");
+		return;
+	}
 	b = wl18_rings.iova;
 	printf("FUXI WLAN: W18 CE rings IOVA %#llx total %u\n", b, total);
 	wl18_ring[0] = (struct wl_ce_ring){ b, (uint8_t *)wl18_rings.va, 16, 4, 0x1b80000u };
@@ -4591,12 +4609,12 @@ wl_w18_ce_rings(void)
 	wl18_ring[4] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2, 128, 1, 0x1b85058u };
 	wl18_ring[5] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2 + ce2s, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2 + ce2s, 32, 4, 0x1b86000u };
 
-	wl_ce_ring_core("CE0-SRC", 0x1b80000u, wl18_ring[0].iova, 16, 4, 64, true);
-	wl_ce_ring_core("CE1-DST", 0x1b81000u, wl18_ring[1].iova, 512, 4, 82, false);
-	wl_ce_ring_core("CE1-STA", 0x1b81058u, wl18_ring[2].iova, 512, 1, 101, false);
-	wl_ce_ring_core("CE2-DST", 0x1b85000u, wl18_ring[3].iova, 128, 4, 83, false);
-	wl_ce_ring_core("CE2-STA", 0x1b85058u, wl18_ring[4].iova, 128, 1, 102, false);
-	wl_ce_ring_core("CE3-SRC", 0x1b86000u, wl18_ring[5].iova, 32, 4, 67, true);
+	wl_ce_ring_core("CE0-SRC", 0x1b80000u, wl18_ring[0].iova, 16, 4, 64, true, 0x400u, wl18_rdp.iova);
+	wl_ce_ring_core("CE1-DST", 0x1b81000u, wl18_ring[1].iova, 512, 4, 82, false, 0x400u, wl18_rdp.iova);
+	wl_ce_ring_core("CE1-STA", 0x1b81058u, wl18_ring[2].iova, 512, 1, 101, false, 0x408u, wl18_rdp.iova);
+	wl_ce_ring_core("CE2-DST", 0x1b85000u, wl18_ring[3].iova, 128, 4, 83, false, 0x400u, wl18_rdp.iova);
+	wl_ce_ring_core("CE2-STA", 0x1b85058u, wl18_ring[4].iova, 128, 1, 102, false, 0x408u, wl18_rdp.iova);
+	wl_ce_ring_core("CE3-SRC", 0x1b86000u, wl18_ring[5].iova, 32, 4, 67, true, 0x400u, wl18_rdp.iova);
 	/* Destination max length, and the status-ring enable for both pipes. */
 	wl_ce_wr(0x1b810b0u, 2048u);
 	wl_ce_wr(0x1b850b0u, 2048u);
