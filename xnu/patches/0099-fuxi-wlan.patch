@@ -4551,7 +4551,7 @@
 +{
 +	struct wl_ce_ring *r = &wl18_ring[ring_idx];
 +	for (unsigned i = 0; i < n; i++) {
-+		uint64_t b = wl19_rx.pa + (uint64_t)i * WL19_BUF;
++		uint64_t b = wl19_rx.iova + (uint64_t)i * WL19_BUF;
 +		volatile uint32_t *d = (volatile uint32_t *)(r->va + (uint64_t)i * 16u);
 +		d[0] = (uint32_t)b;
 +		d[1] = (uint32_t)((b >> 32) & 0xffu);
@@ -4629,7 +4629,7 @@
 +	memcpy(p + 8, body, 12);
 +	wl_dma_clean(&wl20_tx);
 +	uint32_t *d = (uint32_t *)wl18_ring[0].va;
-+	uint64_t pa = wl20_tx.pa;
++	uint64_t pa = wl20_tx.iova;
 +	d[0] = (uint32_t)pa;
 +	d[1] = (uint32_t)((pa >> 32) & 0xffu) | (20u << 16);
 +	d[2] = 0;
@@ -4712,12 +4712,12 @@
 +	wl18_ring[4] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2, 64, 1, 0x1b85058u };
 +	wl18_ring[5] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2 + ce2s, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2 + ce2s, 32, 4, 0x1b86000u };
 +
-+	wl_ce_ring_core("CE0-SRC", 0x1b80000u, wl18_rings.pa, 16, 4, 64, true, 0x400u, wl18_rdp.iova);
-+	wl_ce_ring_core("CE1-DST", 0x1b81000u, wl18_rings.pa + ce0, 512, 4, 82, false, 0x400u, wl18_rdp.iova);
-+	wl_ce_ring_core("CE1-STA", 0x1b81058u, wl18_rings.pa + ce0 + ce1, 512, 1, 101, false, 0x408u, wl18_rdp.iova);
-+	wl_ce_ring_core("CE2-DST", 0x1b85000u, wl18_rings.pa + ce0 + ce1 + ce1s, 64, 4, 83, false, 0x400u, wl18_rdp.iova);
-+	wl_ce_ring_core("CE2-STA", 0x1b85058u, wl18_rings.pa + ce0 + ce1 + ce1s + ce2, 64, 1, 102, false, 0x408u, wl18_rdp.iova);
-+	wl_ce_ring_core("CE3-SRC", 0x1b86000u, wl18_rings.pa + ce0 + ce1 + ce1s + ce2 + ce2s, 32, 4, 67, true, 0x400u, wl18_rdp.iova);
++	wl_ce_ring_core("CE0-SRC", 0x1b80000u, wl18_ring[0].iova, 16, 4, 64, true, 0x400u, wl18_rdp.iova);
++	wl_ce_ring_core("CE1-DST", 0x1b81000u, wl18_ring[1].iova, 512, 4, 82, false, 0x400u, wl18_rdp.iova);
++	wl_ce_ring_core("CE1-STA", 0x1b81058u, wl18_ring[2].iova, 512, 1, 101, false, 0x408u, wl18_rdp.iova);
++	wl_ce_ring_core("CE2-DST", 0x1b85000u, wl18_ring[3].iova, 64, 4, 83, false, 0x400u, wl18_rdp.iova);
++	wl_ce_ring_core("CE2-STA", 0x1b85058u, wl18_ring[4].iova, 64, 1, 102, false, 0x408u, wl18_rdp.iova);
++	wl_ce_ring_core("CE3-SRC", 0x1b86000u, wl18_ring[5].iova, 32, 4, 67, true, 0x400u, wl18_rdp.iova);
 +	/* Destination max length, and the status-ring enable for both pipes. */
 +	wl_ce_wr(0x1b810b0u, 2048u);
 +	wl_ce_wr(0x1b850b0u, 2048u);
