@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5355 @@
+@@ -0,0 +1,5357 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -3906,10 +3906,12 @@
 + * qmi_wlanfw_ce_svc_pipe_cfg_s_v01_ei: service_id, pipe_dir, pipe_num.
 + * hw_params.target_ce_count=9, svc_to_ce_map_len=14 excludes sentinel. */
 +static const uint32_t wl15_target_ce[9][5] = {
-+	{0, 2, 32, 2048, 0}, {1, 1, 32, 2048, 0},
-+	{2, 1, 32, 2048, 0}, {3, 2, 32, 2048, 0},
-+	{4, 2, 256, 256, 8}, {5, 1, 32, 2048, 0},
-+	{6, 3, 32, 16384, 0}, {7, 4, 0, 0, 8}, {8, 3, 32, 16384, 0}
++	/* ath12k_host_ce_config_wcn7850: pipenum, pipedir (1 IN, 2 OUT, 3 INOUT),
++	 * nentries, nbytes_max, flags. CE2 is 64 entries on WCN7850, not 128. */
++	{0, 2, 16, 2048, 0}, {1, 1, 512, 2048, 0},
++	{2, 1, 64, 2048, 0}, {3, 2, 32, 2048, 0},
++	{4, 2, 2048, 256, 8}, {5, 1, 0, 0, 0},
++	{6, 3, 0, 0, 8}, {7, 2, 0, 2048, 8}, {8, 3, 0, 0, 8}
 +};
 +static const uint32_t wl15_service_ce[14][3] = {
 +	{0x104, 2, 3}, {0x104, 1, 2}, /* WMI_DATA_VO */
@@ -4620,7 +4622,7 @@
 +wl_w18_ce_rings(void)
 +{
 +	unsigned ce0 = 16u * 16u, ce1 = 512u * 16u, ce1s = 512u * 4u,
-+	    ce2 = 128u * 16u, ce2s = 128u * 4u, ce3 = 32u * 16u;
++	    ce2 = 64u * 16u, ce2s = 64u * 4u, ce3 = 32u * 16u;
 +	unsigned total = ce0 + ce1 + ce1s + ce2 + ce2s + ce3;
 +	uint64_t b;
 +
@@ -4637,15 +4639,15 @@
 +	wl18_ring[0] = (struct wl_ce_ring){ b, (uint8_t *)wl18_rings.va, 16, 4, 0x1b80000u };
 +	wl18_ring[1] = (struct wl_ce_ring){ b + ce0, (uint8_t *)wl18_rings.va + ce0, 512, 4, 0x1b81000u };
 +	wl18_ring[2] = (struct wl_ce_ring){ b + ce0 + ce1, (uint8_t *)wl18_rings.va + ce0 + ce1, 512, 1, 0x1b81058u };
-+	wl18_ring[3] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s, 128, 4, 0x1b85000u };
-+	wl18_ring[4] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2, 128, 1, 0x1b85058u };
++	wl18_ring[3] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s, 64, 4, 0x1b85000u };
++	wl18_ring[4] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2, 64, 1, 0x1b85058u };
 +	wl18_ring[5] = (struct wl_ce_ring){ b + ce0 + ce1 + ce1s + ce2 + ce2s, (uint8_t *)wl18_rings.va + ce0 + ce1 + ce1s + ce2 + ce2s, 32, 4, 0x1b86000u };
 +
 +	wl_ce_ring_core("CE0-SRC", 0x1b80000u, wl18_ring[0].iova, 16, 4, 64, true, 0x400u, wl18_rdp.iova);
 +	wl_ce_ring_core("CE1-DST", 0x1b81000u, wl18_ring[1].iova, 512, 4, 82, false, 0x400u, wl18_rdp.iova);
 +	wl_ce_ring_core("CE1-STA", 0x1b81058u, wl18_ring[2].iova, 512, 1, 101, false, 0x408u, wl18_rdp.iova);
-+	wl_ce_ring_core("CE2-DST", 0x1b85000u, wl18_ring[3].iova, 128, 4, 83, false, 0x400u, wl18_rdp.iova);
-+	wl_ce_ring_core("CE2-STA", 0x1b85058u, wl18_ring[4].iova, 128, 1, 102, false, 0x408u, wl18_rdp.iova);
++	wl_ce_ring_core("CE2-DST", 0x1b85000u, wl18_ring[3].iova, 64, 4, 83, false, 0x400u, wl18_rdp.iova);
++	wl_ce_ring_core("CE2-STA", 0x1b85058u, wl18_ring[4].iova, 64, 1, 102, false, 0x408u, wl18_rdp.iova);
 +	wl_ce_ring_core("CE3-SRC", 0x1b86000u, wl18_ring[5].iova, 32, 4, 67, true, 0x400u, wl18_rdp.iova);
 +	/* Destination max length, and the status-ring enable for both pipes. */
 +	wl_ce_wr(0x1b810b0u, 2048u);
