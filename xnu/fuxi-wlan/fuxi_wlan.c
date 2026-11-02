@@ -4558,7 +4558,8 @@ wl_ce_ring_core(const char *name, uint32_t reg, uint64_t iova, unsigned entries,
     unsigned dwords, unsigned ring_id, bool src, uint32_t hp_off, uint64_t rdp_iova)
 {
 	unsigned bytes = entries * dwords * 4u;
-	uint32_t msb = (uint32_t)((iova >> 32) & 0xffffu) | (bytes << 16);
+	/* bits[7:0] address[47:32], bits[27:8] ring size in dwords (entry_size*entries) */
+	uint32_t msb = (uint32_t)((iova >> 32) & 0xffu) | ((entries * dwords) << 8);
 	uint64_t rdp = rdp_iova + ring_id;
 	uint32_t misc = ~0u;
 	int e = wl_ce_wr(reg + 0x00u, (uint32_t)iova) |
