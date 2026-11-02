@@ -727,6 +727,8 @@ static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
 static unsigned wl17_ce; /* fuxiwlanw17=1: CE register inventory only */
 static unsigned wl18_ce; /* fuxiwlanw18=1: program CE0..CE3 rings */
 static unsigned wl19_ce; /* fuxiwlanw19=1: post CE RX and log completions */
+static unsigned wl20_htc; /* fuxiwlanw20=1: send HTC setup complete on CE0 */
+static struct wl_dma wl20_tx;
 static struct wl_dma wl19_rx;
 static struct wl_dma wl18_rings;
 static struct wl_dma wl18_rdp;
@@ -918,6 +920,11 @@ wl_probe_configure(void)
 		if (variant < 0 || variant > 1) { wl_variant_invalid = true; }
 		else { wl19_ce = (unsigned)variant; }
 		if (wl19_ce) { printf("FUXI WLAN: W19 CE RX post selected\n"); }
+		variant = 0;
+		(void)PE_parse_boot_argn("fuxiwlanw20", &variant, sizeof(variant));
+		if (variant < 0 || variant > 1) { wl_variant_invalid = true; }
+		else { wl20_htc = (unsigned)variant; }
+		if (wl20_htc) { printf("FUXI WLAN: W20 HTC setup-complete selected\n"); }
 		if (variant) {
 			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
 			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
@@ -4553,6 +4560,44 @@ wl_w19_ce_rx(void)
 	printf("FUXI WLAN: W19 CE RX post done faults %u\n", fw_faults);
 }
 
+/* W20: HTC setup complete on CE0 (host->target control). */
+static void
+wl_w20_htc_tx(void)
+{
+	if (!wl18_ce) { printf("FUXI WLAN: W20 requires fuxiwlanw18=1\n"); return; }
+	if (wl20_tx.va || wl_dma_alloc(&wl20_tx, 64)) {
+		printf("FUXI WLAN: W20 TX allocation failed\n");
+		return;
+	}
+	uint8_t *p = (uint8_t *)wl20_tx.va;
+	uint32_t hdr0 = (12u << 16);      /* endpoint 0, flags 0, payload 12 */
+	uint32_t hdr1 = 0;
+	uint32_t body[3] = { 5u, 0u, 0u }; /* SETUP_COMPLETE_EX, flags, max msgs */
+	memcpy(p, &hdr0, 4);
+	memcpy(p + 4, &hdr1, 4);
+	memcpy(p + 8, body, 12);
+	wl_dma_clean(&wl20_tx);
+	uint32_t *d = (uint32_t *)wl18_ring[0].va;
+	uint64_t pa = wl20_tx.pa;
+	d[0] = (uint32_t)pa;
+	d[1] = (uint32_t)((pa >> 32) & 0xffu) | (20u << 16);
+	d[2] = 0;
+	d[3] = 0;
+	wl_dma_clean(&wl18_rings);
+	if (wl_ce_wr(0x1b80400u, 4u)) { printf("FUXI WLAN: W20 HP publish failed\n"); }
+	uint32_t *rdp = (uint32_t *)wl18_rdp.va;
+	printf("FUXI WLAN: W20 HTC setup-complete sent pa %#llx; rdp0 %#x rdp1 %#x\n",
+	    pa, rdp[0], rdp[1]);
+	for (unsigned ms = 0; ms < 400; ms += 20) {
+		wl_sleep(20);
+		if (rdp[0] || rdp[1] || rdp[2] || rdp[3]) {
+			printf("FUXI WLAN: W20 rdp changed after %u ms: %#x %#x %#x %#x\n",
+			    ms + 20, rdp[0], rdp[1], rdp[2], rdp[3]);
+			break;
+		}
+	}
+	printf("FUXI WLAN: W20 done faults %u\n", fw_faults);
+}
 static int
 wl_ce_ring_core(const char *name, uint32_t reg, uint64_t iova, unsigned entries,
     unsigned dwords, unsigned ring_id, bool src, uint32_t hp_off, uint64_t rdp_iova)
@@ -4657,6 +4702,7 @@ wl_w15_run(void)
 	if (wl17_ce) { wl_w17_inventory(); }
 	if (wl18_ce) { wl_w18_ce_rings(); }
 	if (wl19_ce) { wl_w19_ce_rx(); }
+	if (wl20_htc) { wl_w20_htc_tx(); }
 	wl16_snapshot("MODE reply");
 	wl12_stage = WL15_OBSERVE;
 	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
